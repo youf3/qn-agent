@@ -38,9 +38,10 @@ def get_driver_module(classname):
 
 
 class HardwareAbstractionLayer:
-    def __init__(self, config,  msgclient):
+    def __init__(self, config, rpcclient, msgclient):
 
         self.devs = {}
+        self._rpcclient = rpcclient
         self._msgclient = msgclient
         self._config = config
 

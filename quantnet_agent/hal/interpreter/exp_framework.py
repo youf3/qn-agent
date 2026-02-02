@@ -1,25 +1,20 @@
 import logging
-from quantnet_agent.hal.HAL import ScheduleableInterpreter
+from quantnet_agent.hal.interpreter.experiment_interpreter import ExperimentInterpreter
 from quantnet_mq.schema.models import experiment
 
 log = logging.getLogger(__name__)
 
 
-class ExperimentFramework(ScheduleableInterpreter):
+class ExperimentFramework(ExperimentInterpreter):
 
     def __init__(self, hal):
-        super().__init__(hal)
-        self.parameters = {}
+        super().__init__(hal, experiment, "experiment")
 
-    async def submit(self, *exp_info, **exp_param):
-        log.info(f"Received Experiment submit request : {exp_info} {exp_param}")
-        exp_name = exp_info[0].expName._value
-        class_name = exp_info[0].className._value if "className" in exp_info[0] else None
-        for i in exp_info[0].parameters.data:
-            for k, v in i.items():
-                self.parameters[k] = v
-        exp_id = exp_param["exp_id"]
-        await self.hal.devs["exp_framework"].submit(exp_id, exp_name, class_name, self.parameters)
+    async def run_experiment(self, exp_request):
+        log.info(f"Running experiment: {exp_request}")
+        exp_name = exp_request.expName._value
+        class_name = exp_request.className._value if "className" in exp_request else None
+        await self.hal.devs["exp_framework"].submit(self.expid, exp_name, class_name, self.parameters)
 
     async def update_result(self, exp_id):
         log.info(f"Getting experiment result for {exp_id}")
@@ -44,32 +39,5 @@ class ExperimentFramework(ScheduleableInterpreter):
             "experiment.getState": [self.get_state, "quantnet_mq.schema.models.experiment.getState"],
             "experiment.getInfo": [self.get_info, "quantnet_mq.schema.models.experiment.getInfo"],
             "experiment.setValue": [self.set_value, "quantnet_mq.schema.models.experiment.setValue"],
-        }
-        return commands
-
-    def cancel(self, request):
-        log.info(f"Received Experiment cancel request : {request}")
-        pass
-
-    def get_schedulable_commands(self):
-        commands = {
-            "experiment.submit": [
-                self.submit,
-                "quantnet_mq.schema.models.experiment.submit",
-                experiment.submitResponse,
-                self.update_result
-            ],
-            "experiment.getResult": [
-                self.update_result,
-                "quantnet_mq.schema.models.experiment.getResult",
-                experiment.getResultResponse,
-                None
-                ],
-            "experiment.cancel": [
-                self.cancel,
-                "quantnet_mq.schema.models.experiment.cancel",
-                experiment.cancelResponse,
-                None
-            ]
         }
         return commands

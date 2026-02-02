@@ -74,7 +74,7 @@ class QuantnetAgent:
         self.node = self.get_node(json.load(open(self.config.node_file))["systemSettings"]["type"])
         self._sreg = Register(
             self.config.cid, self.config.node_file, self.config.mq_broker_host, self.config.mq_broker_port,
-            self.node._msgclient
+            self.node._rpcclient, self.node._msgclient
         )
         asyncio.create_task(self._sreg.start())
         await self.scheduler.start()

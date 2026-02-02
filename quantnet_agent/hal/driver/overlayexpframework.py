@@ -23,7 +23,7 @@ class OverlayExpFramework(ExpFramework):
         log.info(f"submitting bsm to {self.bsm_ip}")
         await self._send_message_async(self.bsm_ip, self.bsm_port, b'bsm')
 
-    def receive(self, exp_id):
+    async def receive(self, exp_id):
         return {"result": ""}
 
     @property

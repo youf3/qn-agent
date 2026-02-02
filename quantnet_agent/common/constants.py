@@ -1,15 +1,17 @@
 import os
 from datetime import timedelta
 import quantnet_agent
+import uuid
 
 
 class Constants:
+    INSTANCE_UUID = uuid.uuid4()
     DEFAULT_CONFIG_FILE = "./config/agent.cfg"
     DEFAULT_NODE_CONFIG_FILE = "./config/conf-alice.json"
     DEFAULT_LOGGING_CONFIG_FILE = "./config/logging.conf"
     DEFAULT_INTERPRETERS = {
         "scheduler": "scheduler.py",
-        "calibration": "calibration.py",
+        "calibration": "PSO_interpreter.py",
         "experiment": "exp_framework.py",
     }
     DEFAULT_TASK_PATH = os.path.join(os.path.dirname(os.path.dirname(quantnet_agent.__file__)), "config/")
@@ -17,6 +19,7 @@ class Constants:
         os.path.dirname(quantnet_agent.__file__), "hal/interpreter/calibration_interpreter.py"
     )
     DEFAULT_TASK_NS = "quantnet_agent.task"
+    EXPERIMENT_TOPIC_BASE = "experiment"
     HEARTBEAT_INTERVAL = 10
     REGISTRATION_RETRY_INTERVAL = 10
     MAX_TIMESLOTS = 20000

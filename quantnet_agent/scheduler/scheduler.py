@@ -63,30 +63,47 @@ class AgentScheduler:
         self.is_started = False
         self.cmd_handler = {}
         self.cid = cid
+        self.running_tasks = {}
         self.msgclient = msgclient
 
         def job_listener(event):
-            """Listener for job events to handle updates to remote allocations."""
+            """Listener for job events to handle updates to allocations."""
             job_id = event.job_id
-            matching_remote_allocation = next(
-                (alloc for alloc in self.remote_allocations if job_id in alloc.job_ids), None
-            )
-            matching_local_allocation = next(
-                (alloc for alloc in self.local_allocations if job_id in alloc.job_ids), None
-            )
-            if matching_remote_allocation:
-                if event.exception:
-                    log.error(f"Job {job_id} for allocation {matching_remote_allocation.name} failed.")
-                else:
-                    log.debug(f"Job {job_id} for allocation {matching_remote_allocation.name} executed successfully.")
-            elif matching_local_allocation:
-                if event.exception:
-                    log.error(f"Job {job_id} for allocation {matching_local_allocation.name} failed.")
-                else:
-                    log.debug(f"Job {job_id} for allocation {matching_local_allocation.name} executed successfully.")
-                    if matching_local_allocation.status == Calibration_status.FULL:
-                        # TODO: wait for it to finish and do half or full calibration based on the check
-                        asyncio.create_task(self.publish_result(matching_local_allocation))
+
+            # Find matching allocation across all allocation types
+            all_allocations = self.remote_allocations + self.local_allocations
+            matching_allocation = next((alloc for alloc in all_allocations if job_id in alloc.job_ids), None)
+
+            if not matching_allocation:
+                log.debug(f"No allocation found for job {job_id}")
+                return
+
+            # Track job start
+            if event.code == EVENT_JOB_EXECUTED:
+                self.running_jobs[matching_allocation.name] = job_id
+
+            # Determine allocation type for logging
+            allocation_type = "local" if matching_allocation in self.local_allocations else "remote"
+
+            # Handle job completion or failure
+            if event.exception:
+                log.error(
+                    f"Job {job_id} for {allocation_type} allocation {matching_allocation.name} failed."
+                    f": {event.exception}"
+                )
+            else:
+                log.debug(
+                    f"Job {job_id} for {allocation_type} allocation {matching_allocation.name} executed successfully."
+                )
+
+                # Handle post-completion tasks for local allocations only
+                if (
+                    allocation_type == "local"
+                    and hasattr(matching_allocation, "status")
+                    and matching_allocation.status == Calibration_status.FULL
+                ):
+                    # TODO: wait for it to finish and do half or full calibration based on the check
+                    asyncio.create_task(self.publish_result(matching_allocation))
 
         def missing_job_listener(event):
             job_id = event.job_id
@@ -100,9 +117,7 @@ class AgentScheduler:
 
     async def publish_result(self, allocation):
 
-        result = await allocation.result_handler(
-                            allocation.exp_id, allocation.checking_param
-                        )
+        result = await allocation.result_handler(allocation.exp_id, allocation.checking_param)
         v = {"name": allocation.name}
         if "results" in result:
             v["result"] = result["results"]
@@ -246,17 +261,58 @@ class AgentScheduler:
             asyncio.create_task(self.update_schedule())
 
     def _allocate(self, allocation, indices):
+
         async def run_and_update(allocation, start_time):
+            """Run experiment and update results, with cancellation support."""
+
             msg = monitor.MonitorEvent(
                 rid=self.cid,
                 ts=datetime.now(timezone.utc).timestamp(),
                 eventType="agentTaskSchedulerTask",
                 value=f"Running task {allocation.name} at {start_time}",
             )
-            pub_job = self.msgclient.publish("monitor", msg.as_dict())
+
+            asyncio.create_task(self.msgclient.publish("monitor", msg.as_dict()))
             allocation.last_exec = [datetime.now(timezone.utc), start_time]
-            await allocation.operation(allocation.parameters, exp_id=allocation.exp_id)
-            await pub_job
+
+            try:
+                # Set timeout based on allocation duration
+                timeout_seconds = allocation.duration.total_seconds()
+                log.info(f"Starting task {allocation.name} with timeout of {timeout_seconds} seconds")
+
+                task = asyncio.create_task(allocation.operation(allocation.parameters, exp_id=allocation.exp_id))
+                # Store task for potential cancellation
+                self.running_tasks[allocation.exp_id] = task
+
+                await asyncio.wait_for(task, timeout=timeout_seconds)
+                log.info(f"Task {allocation.name} completed successfully within {timeout_seconds} seconds")
+
+            except asyncio.CancelledError:
+                log.info(f"Experiment {allocation.name} was cancelled")
+                raise
+
+            except asyncio.TimeoutError:
+                log.error(f"Task {allocation.name} timed out after {timeout_seconds} seconds")
+
+                # Cancel remaining jobs for this allocation on timeout
+                if await self._cancel_experiment(allocation.exp_id):
+                    log.info(f"Cancelled remaining jobs for timed out experiment {allocation.exp_id}")
+
+                # Re-raise as a general exception to trigger cancellation logic
+                raise Exception(f"Task {allocation.name} exceeded duration limit of {timeout_seconds} seconds")
+
+            except Exception as e:
+                log.error(f"Error while running task {allocation.name}: {e}")
+
+                # Cancel remaining jobs for this allocation on failure
+                if await self._cancel_experiment(allocation.exp_id):
+                    log.info(f"Cancelled remaining jobs for failed allocation {allocation.name}")
+
+                # Re-raise the exception to maintain error propagation
+                raise e
+            finally:
+                # Remove from tracking
+                self.running_tasks.pop(allocation.name, None)
 
         log.debug(f"Trying to allocate {allocation.name} to {indices}")
 
@@ -336,7 +392,8 @@ class AgentScheduler:
 
     async def handle_submit(self, request):
         async with self.lock:
-            log.info(f"Received allocation request : {request.serialize()}")
+            log.info(f"Received allocation request: {request.payload.exp_id._value}")
+            log.debug(f"{request.serialize()}")
             exp_id = request.payload.exp_id
             timeslotbase = datetime.fromtimestamp(request.payload.timeslotBase._value, tz=timezone.utc)
             base_diff = math.ceil((timeslotbase - self.base) / Constants.SLOTSIZE)
@@ -347,16 +404,34 @@ class AgentScheduler:
 
             if base_diff < 0:
                 log.error("Allocation request is already past the current time")
-                return response_obj(expid=exp_id, status=Status(code=6, value=Code(6).name))
+                return response_obj(
+                    expid=exp_id, status=Status(code=6, value=Code(6).name, reason="Allocation request is in the past")
+                )
             elif base_diff > len(self.timeslots):
                 log.error("Allocation request is too far into the future")
-                return response_obj(expid=exp_id, status=Status(code=6, value=Code(6).name))
+                return response_obj(
+                    expid=exp_id,
+                    status=Status(code=6, value=Code(6).name, reason="Allocation request is too far into the future"),
+                )
             for allocation in request.payload.allocations:
                 timeslot_indices = [i + base_diff for i in allocation.timeSlot]
+                if timeslot_indices[-1] >= len(self.timeslots):
+                    log.error("Allocation request exceeds the current schedulable timeslots")
+                    return response_obj(
+                        expid=exp_id,
+                        status=Status(
+                            code=6,
+                            value=Code(6).name,
+                            reason="Allocation request exceeds the current schedulable timeslots",
+                        ),
+                    )
 
                 if not self._are_slots_empty(timeslot_indices):
-                    log.error(f"Cannot allocate experiment {exp_id}. Slots are already occupied")
-                    return response_obj(expid=exp_id, status=Status(code=6, value=Code(6).name))
+                    log.error(f"Cannot allocate experiment {exp_id}. All current slots are already occupied")
+                    return response_obj(
+                        expid=exp_id,
+                        status=Status(code=6, value=Code(6).name, reason="All current slots are already occupied"),
+                    )
 
                 start_time = self.base + (timeslot_indices[0] * Constants.SLOTSIZE)
 
@@ -384,9 +459,10 @@ class AgentScheduler:
         matching_allocation = next((alloc for alloc in self.remote_allocations if alloc.exp_id == exp_id), None)
 
         if not matching_allocation:
-            log.error(f"No allocation found for exp_id {exp_id}")
+            log.debug(f"No allocation found for exp_id {exp_id}")
             return response_obj(
-                status=Status(Code.FAILED, value=Code.FAIELD.name, reason=f"No allocation found for exp_id {exp_id}")
+                status=Status(code=Code.FAILED, value=Code.FAILED.name, reason=f"No allocation found for exp_id {exp_id}"),
+                result={}
             )
 
         while matching_allocation.last_exec is None:
@@ -400,29 +476,81 @@ class AgentScheduler:
             return response_obj(status=Status(code=Code.OK, value=Code.OK.name), result=result)
         except Exception as e:
             log.error(f"Error while processing result for allocation with exp_id {exp_id}: {e}")
-            return response_obj(status=Status(code=Code.FAILED, value=Code.FAILED.name,
-                                              reason="Error while processing result"))
+            return response_obj(
+                status=Status(code=Code.FAILED, value=Code.FAILED.name, reason="Error while processing result"),
+                result={}
+            )
+
+    async def _cancel_experiment(self, exp_id):
+        """
+        Cancel experiment by finding all matching allocations and cancelling their jobs.
+        """
+        log.info(f"Cancelling all allocations for experiment {exp_id}")
+
+        """Cancel a running experiment."""
+        if exp_id in self.running_tasks:
+            task = self.running_tasks[exp_id]
+            if not task.done():
+                log.debug(f"Cancelling current running experiment {exp_id}")
+                task.cancel()  # This will cancel the wait_for as well
+
+        async with self.lock:
+            # Find all matching allocations
+            matching_allocations = [
+                alloc for alloc in self.remote_allocations if hasattr(alloc, "exp_id") and alloc.exp_id == exp_id
+            ]
+
+            if not matching_allocations:
+                log.debug(f"No allocations found for experiment ID {exp_id}")
+                return 0
+
+            log.debug(f"Found {len(matching_allocations)} allocations for experiment {exp_id}")
+
+            cancelled_count = 0
+
+            # Cancel jobs and clean up for each matching allocation
+            for allocation in matching_allocations:
+                try:
+                    log.debug(f"Cancelling allocation {allocation.name} for experiment {exp_id}")
+
+                    # Cancel all jobs for this allocation
+                    for job_id in allocation.job_ids:
+                        try:
+                            self._scheduler.remove_job(job_id)
+                            log.debug(f"Removed job {job_id} for allocation {allocation.name}")
+                        except JobLookupError:
+                            log.debug(f"Job {job_id} not found when trying to remove")
+
+                    # Clear timeslots occupied by this allocation
+                    for index in range(len(self.timeslots)):
+                        if self.timeslots[index] == allocation:
+                            self.timeslots[index] = None
+
+                    # Reset allocation state
+                    allocation.job_ids = []
+                    allocation.last_allocation = None
+                    cancelled_count += 1
+
+                except Exception as e:
+                    log.error(f"Error cancelling allocation {allocation.name} for experiment {exp_id}: {e}")
+
+            # Remove all matching allocations from remote_allocations in one operation
+            self.remote_allocations = [
+                alloc for alloc in self.remote_allocations if not (hasattr(alloc, "exp_id") and alloc.exp_id == exp_id)
+            ]
+
+            log.debug(f"Successfully cancelled {cancelled_count} allocations for experiment {exp_id}")
+            # TODO: publish cancellation event to the controller
+            return cancelled_count
 
     async def handle_cancel(self, request):
         log.info(f"Received cancelling request: {request.serialize()}")
         log.debug(f"Current jobs : {self._scheduler.get_jobs()}")
         exp_id = request.payload.exp_id
         response_obj = self.cmd_handler[request.cmd][2]
-        try:
-            async with self.lock:
-                for experiment in self.remote_allocations:
-                    if experiment.exp_id == exp_id:
-                        for job_id in experiment.job_ids:
-                            self._scheduler.remove_job(job_id)
-                        for index in range(len(self.timeslots)):
-                            if self.timeslots[index] == exp_id:
-                                self.timeslots[index] = None
-            return response_obj(status=Status(code=0, value=Code(0).name))
-        except JobLookupError:
-            return response_obj(status=Status(code=0, value=Code(0).name))
-        except Exception as e:
-            log.error(f"Failed to cancel experiment {exp_id}: {e}")
-            return response_obj(status=Status(code=6, value=Code(6).name))
+
+        await self._cancel_experiment(exp_id)
+        return response_obj(status=Status(code=0, value=Code(0).name))
 
     def get_allocation(self, task_name):
         """
@@ -441,7 +569,7 @@ class AgentScheduler:
                 return allocation
 
         # If not found, return None
-        log.warning(f"No allocation found for task {task_name}.")
+        log.debug(f"No allocation found for task {task_name}.")
         return None
 
     def register_command(self, ns, interpreter, rpcserver):

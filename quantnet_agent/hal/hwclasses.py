@@ -8,6 +8,10 @@ class Device(ABC):
     def __init__(self, *args, **kwargs):
         self._status = 0
 
+    async def connect(self):
+        log.info(f"Connecting to {self.__class__.__name__}")
+        pass
+
     @property
     def status(self):
         return self._status
@@ -53,7 +57,7 @@ class Filter(Device):
         super().__init__(args, kwargs)
 
     @abstractmethod
-    def polarize(self, *args):
+    async def polarize(self, *args):
         pass
 
     @abstractmethod
@@ -95,7 +99,7 @@ class SignalMeasurement(Device):
         super().__init__(args, kwargs)
 
     @abstractmethod
-    def measure(self):
+    async def measure(self, *args, **kwargs):
         pass
 
 
@@ -104,13 +108,12 @@ class AnalogController(Device):
     def __init__(self, *args, **kwargs):
         pass
 
-    @property
-    def property(self):
+    @abstractmethod
+    async def configure(self, *kwargs):
         pass
 
-    @property.setter
     @abstractmethod
-    def property(self, *kwargs):
+    async def set(self, *kwargs):
         pass
 
 
@@ -119,13 +122,12 @@ class DigitalController(Device):
     def __init__(self, *args, **kwargs):
         super().__init__(args, kwargs)
 
-    @property
-    def property(self):
+    @abstractmethod
+    def configure(self, *kwargs):
         pass
 
-    @property.setter
     @abstractmethod
-    def property(self, *kwargs):
+    def set(self, *kwargs):
         pass
 
 

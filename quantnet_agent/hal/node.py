@@ -7,6 +7,7 @@ import inspect
 from quantnet_agent.common.constants import Constants
 from abc import ABC
 from quantnet_mq.rpcserver import RPCServer
+from quantnet_mq.rpcclient import RPCClient
 from quantnet_agent.hal.HAL import (
     HardwareAbstractionLayer,
     CMDInterpreter,
@@ -14,6 +15,7 @@ from quantnet_agent.hal.HAL import (
     CoreInterpreter,
     ScheduleableInterpreter,
 )
+from quantnet_agent.hal.interpreter.experiment_interpreter import ExperimentInterpreter
 from quantnet_agent.hal.local_task_manager import LocalTaskManager
 
 builtin_interpreter_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interpreter")
@@ -32,12 +34,13 @@ class Node(ABC):
         self.proto_plugins = config.proto_plugins
         self.interpreter_path = config.interpreter_path
         self._rpcserver = RPCServer(self._cid, topic=f"rpc/{self._cid}", host=self._mqhost, port=self._mqport)
+        self._rpcclient = RPCClient(config.rpc_client_name, host=self._mqhost, port=self._mqport)
         self._msgclient = msgclient
         self.local_parameters = {}
         self.plugins = {}
         self.core = {}
         self.scheduler = scheduler
-        self.hal = HardwareAbstractionLayer(config, self._msgclient)
+        self.hal = HardwareAbstractionLayer(config, self._rpcclient, self._msgclient)
         self.local_task_manager = LocalTaskManager(
             self._cid, scheduler, self._msgclient, delay=int(config.task_properties.get("traverse_delay", "0"))
         )
@@ -58,7 +61,7 @@ class Node(ABC):
 
     def __str__(self):
         ret = f"{'NAME':<30}{'TYPE':<30}RESOURCE\n"
-        ret += f"{''.ljust(60,'-')}\n"
+        ret += f"{''.ljust(60, '-')}\n"
         for name, v in self.devices.items():
             ns = "driver"
             path = v.get("driver")
@@ -100,13 +103,13 @@ class Node(ABC):
     def register_task(self, interpreter, task):
         self.local_task_manager.add_task(task, interpreter)
 
-    def register_command(self, ns, interpreter, builtin, is_core):
-        interpreter_obj = interpreter(self) if is_core else interpreter(self.hal)
+    def register_command(self, ns, interpreter_obj, builtin, is_core):
+        # interpreter_obj = interpreter(self) if is_core else interpreter(self.hal)
 
         for cmd, interpreter_map in interpreter_obj.get_commands().items():
 
             if builtin:
-                log.debug(f"Registering command {cmd} from built-in interpreter{interpreter} in namespace {ns}")
+                log.debug(f"Registering command {cmd} from built-in interpreter{interpreter_obj} in namespace {ns}")
                 if is_core:
                     if ns not in self.core:
                         self.core[ns] = {}
@@ -117,7 +120,7 @@ class Node(ABC):
                     target = self.plugins[ns]
                 target[cmd] = interpreter_map
             else:
-                log.debug(f"Registering command {cmd} from user interpreter{interpreter} in namespace {ns}")
+                log.debug(f"Registering command {cmd} from user interpreter{interpreter_obj} in namespace {ns}")
                 if ns in self.core:
                     if cmd in self.core[ns]:
                         log.error(f"Cannot overwrite Cmd {cmd} from core component {self.core[ns][cmd]}")
@@ -128,7 +131,7 @@ class Node(ABC):
                 else:
                     self.plugins[ns] = {}
                     self.plugins[ns][cmd] = interpreter_map
-                    log.debug(f"Overwriting command {cmd} with interpreter{interpreter} in namespace {ns}")
+                    log.debug(f"Overwriting command {cmd} with interpreter{interpreter_obj} in namespace {ns}")
 
             self._rpcserver.set_handler(cmd, interpreter_map[0], interpreter_map[1])
 
@@ -151,12 +154,15 @@ class Node(ABC):
                 issubclass(module, CMDInterpreter)
                 and not module == CMDInterpreter
                 and not module == ScheduleableInterpreter
+                and not module == ExperimentInterpreter
             ):
-                self.register_command(ns, module, builtin, False)
+                interpreter_obj = module(self.hal)
+                self.register_command(ns, interpreter_obj, builtin, False)
                 if issubclass(module, ScheduleableInterpreter):
-                    self.scheduler.register_command(ns, module(self.hal), self._rpcserver)
+                    self.scheduler.register_command(ns, interpreter_obj, self._rpcserver)
             elif issubclass(module, CoreInterpreter) and not module == CoreInterpreter:
-                self.register_command(ns, module, builtin, True)
+                interpreter_obj = module(self)
+                self.register_command(ns, interpreter_obj, builtin, True)
             elif issubclass(module, LocalTaskInterpreter) and not module == LocalTaskInterpreter:
                 self.register_task(module(self.hal), task)
 

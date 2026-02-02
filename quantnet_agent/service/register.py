@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from quantnet_mq.rpcclient import RPCClient
 from quantnet_mq.schema.models import monitor
 from quantnet_agent.common.constants import Constants
 
@@ -10,12 +9,12 @@ log = logging.getLogger(__name__)
 
 
 class Register:
-    def __init__(self, cid, node_config, mqhost, mqport, msgclient):
+    def __init__(self, cid, node_config, mqhost, mqport, rpcclient, msgclient):
         self._cid = cid
         self._node = node_config
         self._mqhost = mqhost
         self._mqport = mqport
-        self._client = RPCClient(cid, host=self._mqhost, port=self._mqport)
+        self._client = rpcclient
         self._rpc_client_handlers = [
             ("register", self.register_response, "quantnet_mq.schema.models.agentRegister"),
             ("deregister", self.deregister_response, "quantnet_mq.schema.models.agentDeregister"),

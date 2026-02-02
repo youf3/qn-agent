@@ -11,10 +11,11 @@ def get_config(config_file):
     config_files = []
     if config_file:
         config_files.append(config_file)
-    if "QUANTNET_HOME" in os.environ:
-        config_files.append(f"{os.environ['QUANTNET_HOME']}/etc/agent.cfg")
     else:
-        config_files.append("/etc/quantnet/agent.cfg")
+        if "QUANTNET_HOME" in os.environ:
+            config_files.append(f"{os.environ['QUANTNET_HOME']}/etc/agent.cfg")
+        else:
+            config_files.append("/etc/quantnet/agent.cfg")
 
     for cf in config_files:
         try:
@@ -74,6 +75,7 @@ class Config:
             except Exception:
                 self.cid = None
 
+        self.rpc_client_name = self.config_get("mq", "rpc_client_name", default=f"qn-client-{Constants.INSTANCE_UUID}")
         if interpreter_path:
             self.interpreter_path = interpreter_path
         else:
@@ -107,7 +109,7 @@ class Config:
                                 raise Exception(
                                     f"Task {task} interval is too short."
                                     "It should be larger than the TDMA slot size "
-                                    f"{Constants.SLOTSIZE.total_seconds() * 1e3 }"
+                                    f"{Constants.SLOTSIZE.total_seconds() * 1e3}"
                                 )
                             self.tasks.append(calibration_task)
                     else:

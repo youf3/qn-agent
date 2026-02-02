@@ -1,7 +1,16 @@
-from quantnet_agent.hal.hwclasses import LightSrc, Filter, LightMeasurement, ExpFramework
+from quantnet_agent.hal.hwclasses import (
+    LightSrc,
+    Filter,
+    SignalMeasurement,
+    LightMeasurement,
+    ExpFramework,
+    DigitalController,
+    AnalogController
+)
 import logging
 import asyncio
 import random
+from quantnet_agent.hal.interpreter.PSO.utility import MeasurementType
 
 log = logging.getLogger(__name__)
 
@@ -64,15 +73,13 @@ class DummyEPC(Filter):
         return
 
     async def polarize(self, _):
-        log.info("Calibrating link using EPC")
-        await asyncio.sleep(5)
-        log.info("Link calibrate")
+        log.debug("Calibrating link using EPC")
+        log.debug("Link calibrate")
         return 0
 
     async def attenuate(self, _):
-        log.info("Attenuate link using EPC")
-        await asyncio.sleep(5)
-        log.info("Link attenuated")
+        log.debug("Attenuate link using EPC")
+        log.debug("Link attenuated")
         return 0
 
     async def cleanUp(self):
@@ -367,6 +374,49 @@ class DummyExpFramework(ExpFramework):
     def logs(self):
         log.info("Getting log from ExpFramework")
         return "Dummy logs"
+
+    async def cleanUp(self):
+        self._status = 0
+        return 0
+
+
+class DummySignalMeasurement(SignalMeasurement):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(args, kwargs)
+        log.info("Initializing Dummy SignalMeasurement")
+        return
+
+    async def measure(self, *args, **kwargs):
+        log.debug("Measuring light")
+        channels = kwargs.get("channels", [1, 2])
+        command = args[0]
+        if command == MeasurementType.RATE:
+            result = [1] * len(channels)
+        elif command == MeasurementType.COINCIDENCE:
+            result = [[1, 1]] * len(channels)
+        else:
+            result = [1] * len(channels)
+        return result
+
+    async def cleanUp(self):
+        self._status = 0
+        return 0
+
+
+class DummyController(DigitalController, AnalogController):
+    def __init__(self, *args, **kwargs):
+        super().__init__(args, kwargs)
+        log.info("Initializing Dummy Controller")
+        return
+
+    async def configure(self, **kwargs):
+        log.info("Configure Dummy Controller")
+        return 0
+
+    async def set(self, **kwargs):
+        log.info("set Dummy Controller")
+        return 0
 
     async def cleanUp(self):
         self._status = 0
