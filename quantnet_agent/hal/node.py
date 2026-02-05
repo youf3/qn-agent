@@ -17,6 +17,8 @@ from quantnet_agent.hal.HAL import (
 )
 from quantnet_agent.hal.interpreter.experiment_interpreter import ExperimentInterpreter
 from quantnet_agent.hal.local_task_manager import LocalTaskManager
+from quantnet_mq import Code
+from quantnet_mq.schema.models import agentSubmitResponse, Status
 
 builtin_interpreter_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interpreter")
 
@@ -40,7 +42,35 @@ class Node(ABC):
         self.plugins = {}
         self.core = {}
         self.scheduler = scheduler
-        self.hal = HardwareAbstractionLayer(config, self._rpcclient, self._msgclient)
+
+        # ATOA RPC System - Client always created, server only if any device is exposed
+        self._atoa_rpcclient = RPCClient(f"{self._cid}-atoa-client", host=self._mqhost, port=self._mqport)
+
+        # Check if any device has expose_remote = true
+        has_exposed_devices = any(
+            device_config.get("expose_remote", False) for device_config in config.devices.values()
+        )
+
+        # Store exposed device names for access control
+        self._exposed_devices = {
+            device_name
+            for device_name, device_config in config.devices.items()
+            if device_config.get("expose_remote", False)
+        }
+
+        if has_exposed_devices:
+            log.info(f"Agent {self._cid} has exposed devices: {self._exposed_devices}. Starting ATOA server.")
+            self._atoa_rpcserver = RPCServer(
+                f"{self._cid}-atoa", topic=f"{Constants.EXPERIMENT_TOPIC_BASE}/+", host=self._mqhost, port=self._mqport
+            )
+            self.register_atoa_commands()
+        else:
+            log.info(f"Agent {self._cid} has no exposed devices. ATOA server disabled.")
+            self._atoa_rpcserver = None
+
+        self.hal = HardwareAbstractionLayer(
+            config, self._rpcclient, self._msgclient, atoa_rpcclient=self._atoa_rpcclient
+        )
         self.local_task_manager = LocalTaskManager(
             self._cid, scheduler, self._msgclient, delay=int(config.task_properties.get("traverse_delay", "0"))
         )
@@ -166,8 +196,56 @@ class Node(ABC):
             elif issubclass(module, LocalTaskInterpreter) and not module == LocalTaskInterpreter:
                 self.register_task(module(self.hal), task)
 
+    def register_atoa_commands(self):
+        """Register commands for the Agent-to-Agent RPC server."""
+        if self._atoa_rpcserver is None:
+            return
+        commands = {"agentSubmit": [self.handle_agent_submit, "quantnet_mq.schema.models.agentSubmit"]}
+        for cmd, (handler, schema) in commands.items():
+            self._atoa_rpcserver.set_handler(cmd, handler, schema)
+
+    async def handle_agent_submit(self, args):
+        """Handle remote requests to control local HAL devices."""
+        log.info(f"Received remote agent submit request : {args}")
+        payload = args["payload"]
+        device_name = payload["device"]
+        function_info = payload["function"]
+        function_name = (
+            function_info["name"]._value if hasattr(function_info["name"], "_value") else function_info["name"]
+        )
+        parameters = function_info["parameters"]
+
+        rc = Code.INVALID_ARGUMENT  # Default error code
+        message = ""
+
+        try:
+            # Access control: verify device is exposed for remote access
+            if device_name not in self._exposed_devices:
+                raise PermissionError(
+                    f"Device {device_name} is not exposed for remote access. "
+                    f"Available devices: {self._exposed_devices}"
+                )
+
+            if device_name not in self.hal.devs:
+                raise ValueError(f"Device {device_name} not found in HAL")
+
+            device = self.hal.devs[device_name]
+            func_obj = getattr(device, function_name)
+            rc = Code.OK
+            message = await func_obj(**parameters)
+        except PermissionError as e:
+            log.warning(f"Access denied for remote agent submit: {e}")
+            message = str(e)
+        except Exception as e:
+            log.error(f"Error in remote agent submit: {type(e)}:{e}")
+            message = f"Failed to run {device_name}.{function_name} with parameters {parameters}. Error: {e}"
+        finally:
+            return agentSubmitResponse(status=Status(code=rc.value, value=rc.name), message=message)
+
     async def start(self):
         await self._rpcserver.start()
+        if self._atoa_rpcserver is not None:
+            await self._atoa_rpcserver.start()
         await self.local_task_manager.start()
 
 

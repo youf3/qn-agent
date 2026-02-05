@@ -1,9 +1,6 @@
 import numpy as np
-import os
-from datetime import datetime
 import time
 import logging
-from quantnet_agent.hal.driver.remote_device import RemotePSG
 from quantnet_agent.hal.interpreter.PSO.utility import (
     MeasureFunction,
     Measure_CostFunction,
@@ -160,7 +157,7 @@ class PSOManager:
 
 
 class PSO:
-    def __init__(self, hal, agent_comms_topic, cb=None):
+    def __init__(self, hal, cb=None):
         self.hal = hal
         # Devices
         self.Alice_PSG = hal.devs["alice-psg"]
@@ -171,7 +168,7 @@ class PSO:
         self.Charlie_TimeTagger = hal.devs["charlie-timetagger"]
         self.Charlie_Rigol1 = hal.devs["charlie-rigol1"]
         self.Charlie_Rigol2 = hal.devs["charlie-rigol2"]
-        self.Bob_PSG = RemotePSG("bob-psg", self.hal._rpcclient, agent_comms_topic)
+        self.Bob_PSG = hal.devs["bob-psg"]
         self.MAX_TRIES = 5
         self.ch1_params = {
             "channel": "1",

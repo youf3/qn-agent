@@ -32,6 +32,7 @@ class Config:
         node_file: str = None,
         debug: bool = False,
         agent_id: str = None,
+        role: str = None,
         mq_broker_host: str = None,
         mq_broker_port: int = None,
         interpreter_path: str = None,
@@ -74,6 +75,11 @@ class Config:
                 self.cid = self.config_get("agent", "agent_id")
             except Exception:
                 self.cid = None
+
+        if role:
+            self.role = role
+        else:
+            self.role = self.config_get("agent", "role", default=None, raise_exception=False)
 
         self.rpc_client_name = self.config_get("mq", "rpc_client_name", default=f"qn-client-{Constants.INSTANCE_UUID}")
         if interpreter_path:

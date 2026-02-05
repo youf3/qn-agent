@@ -5,7 +5,6 @@ import importlib
 import sys
 from abc import ABC, abstractmethod
 import traceback
-from pydantic import TypeAdapter
 
 log = logging.getLogger(__name__)
 driver_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver")
@@ -38,16 +37,17 @@ def get_driver_module(classname):
 
 
 class HardwareAbstractionLayer:
-    def __init__(self, config, rpcclient, msgclient):
-
+    def __init__(self, config, rpcclient, msgclient, atoa_rpcclient=None):
         self.devs = {}
         self._rpcclient = rpcclient
+        self._atoa_rpcclient = atoa_rpcclient
         self._msgclient = msgclient
         self._config = config
 
         for device, property in config.devices.items():
-            enabled = property.get("enabled")
-            if enabled and not TypeAdapter(bool).validate_python(enabled):
+            if "device" not in property:
+                property["device"] = device
+            if not property.get("enabled", False):
                 continue
             if device in self.devs:
                 log.error(f"Duplicated Device {device}")
@@ -56,14 +56,31 @@ class HardwareAbstractionLayer:
             if dev_cls is None:
                 continue
             try:
-                dev = dev_cls(property,
-                              config.node_file,
-                              config.mq_broker_host,
-                              config.mq_broker_port)
+                kwargs = {
+                    "property": property,
+                    "node": config.node_file,
+                    "mq_broker_host": config.mq_broker_host,
+                    "mq_broker_port": config.mq_broker_port,
+                }
+                if property.get("is_remote", False):
+                    kwargs["rpcclient"] = self._atoa_rpcclient
+
+                dev = dev_cls(**kwargs)
             except Exception as e:
                 log.error(f"Cannot instantiate driver class {dev_cls}: {e}")
                 continue
             self.devs[device] = dev
+
+    @property
+    def config(self):
+        return self._config
+
+    def set_experiment_topic(self, topic):
+        """Update the communication topic for all remote devices."""
+        log.info(f"Setting experiment topic to {topic}")
+        for dev in self.devs.values():
+            if hasattr(dev, "agent_comms_topic"):
+                dev.agent_comms_topic = topic
 
 
 class Interpreter(ABC):

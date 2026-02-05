@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 import json
 import signal
 from quantnet_agent.hal.interpreter.PSO.PSO import PSO
-from quantnet_agent.hal.driver.remote_device import RemotePSG
 from quantnet_agent.hal.interpreter.PSO.utility import (
     MeasureFunction,
     PSOParams,
@@ -48,7 +47,7 @@ class PolarizationStabilization:
 
     async def initial_stabilization(self):
 
-        self.PSO = PSO(self.hal, self.agent_comms_topic, cb=self.__publish)
+        self.PSO = PSO(self.hal, cb=self.__publish)
 
         # NOTE Step.run() does not check whether self.failed_badly is True or False when self.success = False,
         # only Step.check() does this
@@ -165,7 +164,7 @@ class PolarizationStabilization:
 
 
 class BSM:
-    def __init__(self, hal, msgclient, agent_comms_topic, cb=None):
+    def __init__(self, hal, msgclient, cb=None):
         self.BSM_tracking_data = []
         self.is_pol_init = False
         self.ps = None
@@ -175,7 +174,6 @@ class BSM:
         self.expid = ""
         self.msgclient = msgclient
         self.hal = hal
-        self.agent_comms_topic = agent_comms_topic
 
         self.Alice_PSG = hal.devs["alice-psg"]
         self.Alice_EPC = hal.devs["alice-epc"]
@@ -185,7 +183,7 @@ class BSM:
         self.Charlie_TimeTagger = hal.devs["charlie-timetagger"]
         self.Charlie_Rigol1 = hal.devs["charlie-rigol1"]
         self.Charlie_Rigol2 = hal.devs["charlie-rigol2"]
-        self.Bob_PSG = RemotePSG("bob-psg", self.hal._rpcclient, self.agent_comms_topic)
+        self.Bob_PSG = hal.devs["bob-psg"]
 
     async def HOM_time_scan(self):
         await self.Alice_PSG.polarize("H")

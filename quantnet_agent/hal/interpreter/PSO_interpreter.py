@@ -2,7 +2,6 @@ import logging
 from quantnet_agent.hal.interpreter.experiment_interpreter import ExperimentInterpreter
 from quantnet_mq.schema.models import calibration
 from quantnet_agent.hal.interpreter.PSO.PSO import PSO
-from quantnet_agent.common.constants import Constants
 
 log = logging.getLogger(__name__)
 
@@ -12,14 +11,13 @@ class PSOInterpreter(ExperimentInterpreter):
     def __init__(self, hal):
         super().__init__(hal, calibration, "calibration")
         self.PSO = None
+        self.parameters = {}  # For Bob role
 
     async def run_experiment(self, exp_request):
         log.info("Received Link Calibration submit request")
         log.debug(f"{exp_request}")
 
-        agent_comms_topic = f"{Constants.EXPERIMENT_TOPIC_BASE}/{self.expid}"
-
-        self.PSO = PSO(self.hal, agent_comms_topic, cb=self._publish)
+        self.PSO = PSO(self.hal, cb=self._publish)
         await self.PSO.init()
         await self.PSO.run_Bob_H1_Stabilization()
         await self.PSO.run_Bob_D2_Stabilization()
@@ -63,3 +61,55 @@ class PSOInterpreter(ExperimentInterpreter):
             return False
 
         return self.PSO.step1_success and self.PSO.step2_success and self.PSO.step3_success and self.PSO.step4_success
+
+    # Bob role methods (from PSO_b_interpreter)
+    async def submit(self, *exp_info, **exp_param):
+        log.info(f"Received Link Calibration submit request : {exp_info} {exp_param}")
+
+        # 1. Always store parameters (Common logic)
+        for i in exp_info[0].parameters.data:
+            for k, v in i.items():
+                self.parameters[k] = v
+
+        # 2. Check role: Explicitly check 'bob' role.
+        role = self.hal.config.role if self.hal.config.role else self.hal.config.cid
+        is_bob = role.lower() == "bob"
+
+        if not is_bob:
+            # Alice/Charlie (Executor) role: delegate to parent to run experiment
+            log.info(f"Agent acting as {role} (Executor) - running Link Calibration")
+            await super().submit(*exp_info, **exp_param)
+        else:
+            # Bob (Coordinator) role: just stored params, do nothing else
+            log.info(f"Agent acting as {role} (Coordinator) - stored parameters, skipping execution")
+
+    async def update_result(self, exp_id):
+        log.info(f"Getting calibration result for {exp_id}")
+        return {"result": ""}
+
+    def cancel(self, request):
+        log.info(f"Received calibration cancel request : {request}")
+        pass
+
+    def get_schedulable_commands(self):
+        commands = {
+            "calibration.submit": [
+                self.submit,
+                "quantnet_mq.schema.models.calibration.submit",
+                calibration.submitResponse,
+                None,
+            ],
+            "calibration.getResult": [
+                self.update_result,
+                "quantnet_mq.schema.models.calibration.getResult",
+                calibration.getResultResponse,
+                None,
+            ],
+            "calibration.cancel": [
+                self.cancel,
+                "quantnet_mq.schema.models.calibration.cancel",
+                calibration.cancelResponse,
+                None,
+            ],
+        }
+        return commands

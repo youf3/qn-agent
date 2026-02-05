@@ -3,10 +3,7 @@ import json
 from datetime import datetime, timezone
 from abc import abstractmethod
 from quantnet_agent.hal.HAL import ScheduleableInterpreter
-from quantnet_mq.schema.models import (
-    agentSubmitResponse,
-    Status,
-)
+from quantnet_agent.common.constants import Constants
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +43,10 @@ class ExperimentInterpreter(ScheduleableInterpreter):
         log.info(f"Received {self.command_namespace} submit request")
 
         self.expid = exp_param["exp_id"]._value
+
+        # Calculate and broadcast experiment topic
+        topic = f"{Constants.EXPERIMENT_TOPIC_BASE}/{self.expid}"
+        self.hal.set_experiment_topic(topic)
 
         if hasattr(exp_info[0], "parameters") and hasattr(exp_info[0].parameters, "data"):
             for i in exp_info[0].parameters.data:
