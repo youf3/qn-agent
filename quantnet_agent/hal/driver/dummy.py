@@ -5,7 +5,7 @@ from quantnet_agent.hal.hwclasses import (
     LightMeasurement,
     ExpFramework,
     DigitalController,
-    AnalogController
+    AnalogController,
 )
 import logging
 import asyncio
@@ -63,6 +63,28 @@ class DummyLightSrc(LightSrc):
     @property
     def status(self):
         return self._status
+
+
+class DummyPSG(Filter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(args, kwargs)
+        self.dev = "DummyPSG"
+        log.info("DummyPSG initialized")
+
+    async def connect(self):
+        log.info("DummyPSG connected")
+
+    async def polarize(self, state):
+        log.debug(f"DummyPSG polarize to {state}")
+        return 0
+
+    async def attenuate(self, attenuation):
+        log.debug(f"DummyPSG attenuate to {attenuation}")
+        return 0
+
+    async def cleanUp(self):
+        log.info("DummyPSG cleanup")
+        return 0
 
 
 class DummyEPC(Filter):
@@ -391,12 +413,26 @@ class DummySignalMeasurement(SignalMeasurement):
         log.debug("Measuring light")
         channels = kwargs.get("channels", [1, 2])
         command = args[0]
+        import numpy as np
+
+        # Use simple fixed values for deterministic testing or random for simulation
+        # Using fixed values to avoid "random" failures in threshold checks if not handled
         if command == MeasurementType.RATE:
-            result = [1] * len(channels)
+            # ROI: BSM.py uses sum(single_counts).
+            # If channels=[1,2,3,4], result should be array of length 4.
+            # PSO.py uses result indices.
+            result = np.array([1000.0] * len(channels))
         elif command == MeasurementType.COINCIDENCE:
-            result = [[1, 1]] * len(channels)
+            # ROI: BSM.py expects coincidence_hist[channel_pair_index]
+            # It sums it: np.sum(HOM_coincidence_hist)
+            # It expects shape (len(channel_pairs), n_bins)
+            n_bins = kwargs.get("n_bins", 100)
+            # Return list of arrays, one per channel pair
+            # Shape: (len(channels), n_bins)
+            num_pairs = len(channels)
+            result = [np.ones(n_bins) * 10 for _ in range(num_pairs)]
         else:
-            result = [1] * len(channels)
+            result = np.array([1.0] * len(channels))
         return result
 
     async def cleanUp(self):
@@ -416,6 +452,10 @@ class DummyController(DigitalController, AnalogController):
 
     async def set(self, **kwargs):
         log.info("set Dummy Controller")
+        return 0
+
+    async def control_channel(self, channel, setting):
+        log.info(f"DummyController control_channel {channel} {setting}")
         return 0
 
     async def cleanUp(self):
