@@ -103,7 +103,7 @@ class AgentScheduler:
         result = await allocation.result_handler(
                             allocation.exp_id, allocation.checking_param
                         )
-        v = {"name": allocation.name}
+        v = {"name": allocation.name, "exp_id": allocation.exp_id}
         if "results" in result:
             v["result"] = result["results"]
             msg = monitor.MonitorEvent(

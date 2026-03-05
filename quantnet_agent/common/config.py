@@ -18,7 +18,7 @@ def get_config(config_file):
 
     for cf in config_files:
         try:
-            config = configobj.ConfigObj(cf)
+            config = configobj.ConfigObj(cf, file_error=True)
         except IOError:
             continue
     return config
