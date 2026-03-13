@@ -20,7 +20,7 @@ class Constants:
     HEARTBEAT_INTERVAL = 10
     REGISTRATION_RETRY_INTERVAL = 10
     MAX_TIMESLOTS = 20000
-    SLOTSIZE = timedelta(milliseconds=100)
+    SLOTSIZE = timedelta(milliseconds=3)
     SCHEDULER_GRACE_PERIOD = timedelta(milliseconds=50)
     # TODO: Check SCHEDULER_GRACE_PERIOD < SLOTSIZE * MAX_TIMESLOTS
     UPDATE_INTERVAL = SLOTSIZE * MAX_TIMESLOTS / 2
