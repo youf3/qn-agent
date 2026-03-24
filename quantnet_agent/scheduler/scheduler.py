@@ -109,7 +109,7 @@ class AgentScheduler:
             msg = monitor.MonitorEvent(
                 rid=self.cid,
                 ts=datetime.now(timezone.utc).timestamp(),
-                eventType="experimentResult",
+                eventType="agentTaskResult",
                 value=v,
             )
             await self.msgclient.publish("monitor", msg.as_dict())
