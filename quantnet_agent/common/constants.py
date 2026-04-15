@@ -4,7 +4,6 @@ import quantnet_agent
 
 
 class Constants:
-    DEFAULT_CONFIG_FILE = "./config/agent.cfg"
     DEFAULT_NODE_CONFIG_FILE = "./config/conf-alice.json"
     DEFAULT_LOGGING_CONFIG_FILE = "./config/logging.conf"
     DEFAULT_INTERPRETERS = {
