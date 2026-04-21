@@ -7,22 +7,31 @@ from quantnet_agent.common.constants import Constants
 log = logging.getLogger(__name__)
 
 
-def find_config_file(cli_config_file=None):
-    if cli_config_file:
-        return cli_config_file
-
-    paths = []
-    if "QUANTNET_HOME" in os.environ:
-        paths.append(os.path.join(os.environ["QUANTNET_HOME"], "etc", "agent.cfg"))
-
-    paths.append("/opt/quantnet/etc/agent.cfg")
-
-    for path in paths:
-        if os.path.exists(path):
-            return path
-
-
 _CACHED_PARSER = None
+
+
+def find_config_file(config_file):
+    config_files = []
+    if config_file:
+        if not os.path.exists(config_file):
+            import sys
+
+            print(f"Error: Specified configuration file '{config_file}' does not exist.", file=sys.stderr)
+            sys.exit(3)
+        config_files.append(config_file)
+
+    if "QUANTNET_HOME" in os.environ:
+        config_files.append(f"{os.environ['QUANTNET_HOME']}/etc/agent.cfg")
+    else:
+        config_files.append("/etc/quantnet/agent.cfg")
+
+    for cf in config_files:
+        try:
+            config = configobj.ConfigObj(cf, file_error=True)
+            return config
+        except IOError:
+            continue
+    return None
 
 
 class Config:

@@ -30,17 +30,6 @@ from quantnet_agent.common.logging import setup_logging
 def main(config, agent_id, node_config, mq_broker_host, mq_broker_port, debug, interpreter_path, schema_path):
     cobj = Config(config, node_config, debug, agent_id, mq_broker_host, mq_broker_port, interpreter_path, schema_path)
 
-    if not cobj.config_file:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "No configuration file found, continuing with defaults.\n"
-            "\tThe quant-net agent looks in the following directories for a configuration file, in order:\n"
-            "\t(1) --config CLI argument\n"
-            "\t(2) $QUANTNET_HOME/etc/agent.cfg\n"
-            "\t(3) /opt/quantnet/etc/agent.cfg"
-        )
-
     if cobj.node_file is None:
         print("No node configuration file specified. Use --node-config (-n) to provide one.")
         sys.exit(1)
