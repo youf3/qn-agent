@@ -34,14 +34,16 @@ log = logging.getLogger(__name__)
 def main(config, agent_id, node_config, mq_broker_host, mq_broker_port, debug, interpreter_path, schema_path):
     cobj = Config(config, node_config, debug, agent_id, mq_broker_host, mq_broker_port, interpreter_path, schema_path)
 
+    setup_logging(cobj)
+
     if cobj.node_file is None:
         log.error("No node configuration file specified. Use --node-config (-n) to provide one.")
         sys.exit(1)
 
-    setup_logging(cobj)
-
     if cobj.config_file:
-        log.info(f"Loaded configuration from {cobj.config_file}")
+        log.info(f"Loaded agent configuration from {cobj.config_file}")
+    else:
+        log.warning("No agent configuration file found, continuing with defaults")
 
     agent = QuantnetAgent(cobj)
     agent.run()
