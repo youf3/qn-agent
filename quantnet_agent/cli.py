@@ -1,9 +1,13 @@
 import socket
 import click
 import sys
+import logging
+
 from quantnet_agent.service import QuantnetAgent
 from quantnet_agent.common import Config
 from quantnet_agent.common.logging import setup_logging
+
+log = logging.getLogger(__name__)
 
 
 @click.command("Quantnet Agent")
@@ -31,10 +35,13 @@ def main(config, agent_id, node_config, mq_broker_host, mq_broker_port, debug, i
     cobj = Config(config, node_config, debug, agent_id, mq_broker_host, mq_broker_port, interpreter_path, schema_path)
 
     if cobj.node_file is None:
-        print("No node configuration file specified. Use --node-config (-n) to provide one.")
+        log.error("No node configuration file specified. Use --node-config (-n) to provide one.")
         sys.exit(1)
 
     setup_logging(cobj)
+
+    if cobj.config_file:
+        log.info(f"Loaded configuration from {cobj.config_file}")
 
     agent = QuantnetAgent(cobj)
     agent.run()

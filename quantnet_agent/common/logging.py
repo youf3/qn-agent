@@ -10,7 +10,7 @@ def quantnet_log_formatter(cobj=None):
         "logformat",
         default="{asctime} {name:<29} {process} {levelname:>8} {message}",
     )
-    return logging.Formatter(fmt=config_logformat, style='{')
+    return logging.Formatter(fmt=config_logformat, style="{")
 
 
 def setup_default_logging(cobj=None):
@@ -18,8 +18,7 @@ def setup_default_logging(cobj=None):
     Configures the logging by setting the output stream to stdout and
     configures log level and log format.
     """
-    config_loglevel = getattr(logging, cobj.get("common", "loglevel",
-                              default="INFO").upper())
+    config_loglevel = getattr(logging, cobj.get("common", "loglevel", default="INFO").upper())
 
     stdouthandler = logging.StreamHandler(stream=sys.stdout)
     stdouthandler.setFormatter(quantnet_log_formatter(cobj))
@@ -57,3 +56,4 @@ def setup_logging(cobj=None):
 
     if not has_config and cobj:
         setup_default_logging(cobj)
+    logging.getLogger("gmqtt").setLevel(logging.WARNING)

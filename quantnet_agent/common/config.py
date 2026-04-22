@@ -2,23 +2,19 @@ import os
 import logging
 import configobj
 import json
+import sys
 from quantnet_agent.common.constants import Constants
 
 log = logging.getLogger(__name__)
-
-
-_CACHED_PARSER = None
 
 
 def find_config_file(config_file):
     config_files = []
     if config_file:
         if not os.path.exists(config_file):
-            import sys
-
-            print(f"Error: Specified configuration file '{config_file}' does not exist.", file=sys.stderr)
+            log.error(f"Specified configuration file '{config_file}' does not exist.")
             sys.exit(3)
-        config_files.append(config_file)
+        return config_file
 
     if "QUANTNET_HOME" in os.environ:
         config_files.append(f"{os.environ['QUANTNET_HOME']}/etc/agent.cfg")
@@ -26,11 +22,8 @@ def find_config_file(config_file):
         config_files.append("/etc/quantnet/agent.cfg")
 
     for cf in config_files:
-        try:
-            config = configobj.ConfigObj(cf, file_error=True)
-            return config
-        except IOError:
-            continue
+        if os.path.exists(cf):
+            return cf
     return None
 
 
@@ -46,22 +39,14 @@ class Config:
         interpreter_path: str = None,
         schema_path: str = None,
     ):
-        global _CACHED_PARSER
         self.config_file = find_config_file(config_file)
 
-        if _CACHED_PARSER is None or config_file:
-            self._parser = {}
-            if self.config_file:
-                try:
-                    self._parser = configobj.ConfigObj(self.config_file)
-                    log.info(f"Loaded configuration from {self.config_file}")
-                except IOError:
-                    pass
-
-            if _CACHED_PARSER is None or self.config_file:
-                _CACHED_PARSER = self._parser
-        else:
-            self._parser = _CACHED_PARSER
+        self._parser = {}
+        if self.config_file:
+            try:
+                self._parser = configobj.ConfigObj(self.config_file)
+            except IOError:
+                pass
 
         self.node_file = self._resolve(node_file, "agent", "node_file", None)
         self.mq_broker_host = self._resolve(mq_broker_host, "mq", "host", "127.0.0.1")
