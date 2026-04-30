@@ -11,7 +11,6 @@ class Constants:
         "calibration": "calibration.py",
         "experiment": "exp_framework.py",
     }
-    DEFAULT_TASK_PATH = os.path.join(os.path.dirname(os.path.dirname(quantnet_agent.__file__)), "config/")
     DEFAULT_TASK_INTERPRETER = os.path.join(
         os.path.dirname(quantnet_agent.__file__), "hal/interpreter/calibration_interpreter.py"
     )
