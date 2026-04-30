@@ -76,8 +76,9 @@ class Config:
             for task, property in self._parser["tasks"].items():
                 try:
                     if type(property) is configobj.Section:
-                        with open(os.path.join(Constants.DEFAULT_TASK_PATH, property["path"]), "r") as file:
+                        with open(property["path"], "r") as file:
                             calibration_task = json.load(file)
+                            calibration_task["_path"] = property["path"]
                             if float(calibration_task["Periodicity"]) <= Constants.SLOTSIZE.total_seconds():
                                 raise Exception(
                                     f"Task {task} interval is too short."
