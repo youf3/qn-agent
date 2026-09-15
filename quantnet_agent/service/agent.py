@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 from quantnet_agent.common.config import Config
 from quantnet_agent.service.register import Register
 from quantnet_agent.scheduler.scheduler import AgentScheduler
+from quantnet_agent.hal.link_state_table import LinkStateTable
+from quantnet_agent.service.link_adjacency import LinkAdjacencyManager
 from quantnet_mq.schema.models import Schema
 from quantnet_mq.msgclient import MsgClient
 
@@ -28,6 +30,8 @@ class QuantnetAgent:
         self._tpool = ThreadPoolExecutor(self.threads)
         self.scheduler = AgentScheduler(config.cid, self.msgclient)
         self._sreg = None
+        self._link_state_table = None
+        self._link_mgr = None
 
     async def handle_exit(self, sig: int, frame: Optional[FrameType]) -> None:
         if self.should_exit and sig == signal.SIGINT:
@@ -35,6 +39,8 @@ class QuantnetAgent:
         else:
             self.should_exit = True
         await self._sreg.stop()
+        if hasattr(self, "_link_mgr") and self._link_mgr is not None:
+            await self._link_mgr.stop()
 
     def run(self) -> None:
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -72,11 +78,37 @@ class QuantnetAgent:
         self.load_schema(self.config.schema_path)
         log.info(f"Agent started with protocol namespaces:\n{Schema()}")
         self.node = self.get_node(json.load(open(self.config.node_file))["systemSettings"]["type"])
+
+        # Create and wire link state table
+        self._link_state_table = LinkStateTable()
+        self.node.hal.link_state_table = self._link_state_table
+
+        # Create link adjacency manager
+        self._link_mgr = LinkAdjacencyManager(
+            cid=self.config.cid,
+            node_config=self.config.node_file,
+            mqhost=self.config.mq_broker_host,
+            mqport=self.config.mq_broker_port,
+            link_state_table=self._link_state_table,
+            hello_interval=self.config.link_hello_interval,
+            hold_time=self.config.link_hold_time,
+        )
+        asyncio.create_task(self._link_mgr.start())
+
         self._sreg = Register(
             self.config.cid, self.config.node_file, self.config.mq_broker_host, self.config.mq_broker_port,
             self.node._msgclient
         )
         asyncio.create_task(self._sreg.start())
+
+        # Watch for registration and set link manager's registered flag
+        async def _watch_registration():
+            while not self._sreg.registered:
+                await asyncio.sleep(1)
+            self._link_mgr.registered = True
+
+        asyncio.create_task(_watch_registration())
+
         await self.scheduler.start()
         await self.node.start()
         self.started = True
