@@ -13,6 +13,7 @@ from quantnet_agent.service.register import Register
 from quantnet_agent.scheduler.scheduler import AgentScheduler
 from quantnet_agent.hal.link_state_table import LinkStateTable
 from quantnet_agent.service.link_adjacency import LinkAdjacencyManager
+from quantnet_agent.service.repl import AgentREPL
 from quantnet_mq.schema.models import Schema
 from quantnet_mq.msgclient import MsgClient
 
@@ -32,6 +33,7 @@ class QuantnetAgent:
         self._sreg = None
         self._link_state_table = None
         self._link_mgr = None
+        self._repl = None
 
     async def handle_exit(self, sig: int, frame: Optional[FrameType]) -> None:
         if self.should_exit and sig == signal.SIGINT:
@@ -112,6 +114,10 @@ class QuantnetAgent:
         await self.scheduler.start()
         await self.node.start()
         self.started = True
+
+        # Start REPL
+        self._repl = AgentREPL(self.config.cid, self._link_mgr, self._link_state_table)
+        await self._repl.start()
 
     async def main_loop(self) -> None:
         counter = 0
