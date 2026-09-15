@@ -52,6 +52,13 @@ class Config:
         self.mq_broker_host = self._resolve(mq_broker_host, "mq", "host", "127.0.0.1")
         self.mq_broker_port = self._resolve(mq_broker_port, "mq", "port", "1883")
 
+        self.link_hello_interval = int(
+            self._resolve(None, "link", "hello_interval", str(Constants.DEFAULT_LINK_HELLO_INTERVAL))
+        )
+        self.link_hold_time = int(
+            self._resolve(None, "link", "hold_time", str(Constants.DEFAULT_LINK_HOLD_TIME))
+        )
+
         self.threads = int(self._resolve(None, "agent", "threads", 8))
         self.debug = self._resolve(debug if debug else None, "agent", "debug", False)
 
