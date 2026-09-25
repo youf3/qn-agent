@@ -146,3 +146,87 @@ class ExpFramework(Device):
     @abstractmethod
     def logs(self):
         pass
+
+
+class EntanglementSource(Device):
+    """Abstract interface for continuous entanglement generation.
+
+    Deployment-specific drivers implement this to expose whatever
+    entanglement generation mechanism the hardware provides.  QNCP does
+    not implement the generation mechanism itself — that is entirely
+    behind this interface.
+
+    The five operations form a lifecycle:
+        capabilities() → enable(peer, cfg) → status(peer) → consume(peer) → disable(peer)
+    """
+
+    @abstractmethod
+    async def enable(self, peer_id: str, config: dict) -> dict:
+        """Enable continuous entanglement generation with a peer.
+
+        Parameters
+        ----------
+        peer_id : str
+            Identifier of the peer QPU node.
+        config : dict
+            Deployment-specific configuration.  Common keys:
+              pool_size (int): how many pairs to maintain
+              min_fidelity (float): minimum acceptable pair fidelity
+              comm_positions (list[int]): comm qubits for storage
+
+        Returns
+        -------
+        dict
+            ``{"status": "ok"}`` or ``{"status": "error", "reason": "..."}``.
+        """
+        pass
+
+    @abstractmethod
+    async def status(self, peer_id: str) -> dict:
+        """Query entanglement status with a peer.
+
+        Returns
+        -------
+        dict
+            ``{"available": bool, "pairs": int, "enabled": bool}``
+        """
+        pass
+
+    @abstractmethod
+    async def consume(self, peer_id: str) -> dict | None:
+        """Consume one entangled pair with a peer.
+
+        Returns
+        -------
+        dict or None
+            Pair data if available::
+
+                {"comm_qubit_local": int, "comm_qubit_remote": int,
+                 "fidelity": float, "generation_time": float}
+
+            ``None`` if no pair is currently available.
+        """
+        pass
+
+    @abstractmethod
+    async def disable(self, peer_id: str) -> dict:
+        """Disable continuous entanglement generation with a peer.
+
+        Returns
+        -------
+        dict
+            ``{"status": "ok"}`` or ``{"status": "error", "reason": "..."}``.
+        """
+        pass
+
+    @abstractmethod
+    async def capabilities(self) -> dict:
+        """Report what this entanglement source supports.
+
+        Returns
+        -------
+        dict
+            ``{"continuous_generation": bool, "max_peers": int,
+              "max_pool_size": int, "supports_fidelity_tracking": bool}``
+        """
+        pass
