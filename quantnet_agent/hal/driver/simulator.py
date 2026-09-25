@@ -286,6 +286,72 @@ class SimEGPDriver(SimulatorDriver):
         return resp
 
 
+class SimEntanglementSource(SimulatorDriver):
+    """Simulation driver for continuous entanglement generation.
+
+    Delegates all operations to quantnet-sim via the standard
+    ``SimulatorDriver`` RPC delegation pattern.
+    """
+
+    def __init__(self, property, node_config, mqhost, mqport, *args, **kwargs):
+        node_name = json.load(open(node_config))["systemSettings"]["name"]
+        device = property.get("protocol", "entanglement_source")
+        super().__init__(node_name, device, mqhost, mqport)
+        log.info("Initializing SimEntanglementSource driver.")
+
+    async def _ensure_started(self):
+        if not self._started:
+            await self.start()
+
+    async def enable(self, peer_id, config):
+        await self._ensure_started()
+        resp = await self._sendRPC({
+            "op": "entanglement.enable",
+            "peer_id": peer_id,
+            "config": config,
+        })
+        log.info("SimEntanglementSource: enable peer=%s resp=%s",
+                 peer_id, resp)
+        return resp
+
+    async def status(self, peer_id):
+        await self._ensure_started()
+        resp = await self._sendRPC({
+            "op": "entanglement.status",
+            "peer_id": peer_id,
+        })
+        return resp
+
+    async def consume(self, peer_id):
+        await self._ensure_started()
+        resp = await self._sendRPC({
+            "op": "entanglement.consume",
+            "peer_id": peer_id,
+        })
+        return resp
+
+    async def disable(self, peer_id):
+        await self._ensure_started()
+        resp = await self._sendRPC({
+            "op": "entanglement.disable",
+            "peer_id": peer_id,
+        })
+        log.info("SimEntanglementSource: disable peer=%s resp=%s",
+                 peer_id, resp)
+        return resp
+
+    async def capabilities(self):
+        await self._ensure_started()
+        resp = await self._sendRPC({
+            "op": "entanglement.capabilities",
+        })
+        return resp
+
+    async def cleanUp(self):
+        self._status = 0
+        return 0
+
+
 class PassthroughDriver(SimulatorDriver):
     """
     Passthrough Driver that send RPC messages to the given node.
