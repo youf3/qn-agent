@@ -107,6 +107,9 @@ class DummyEntanglementSource(EntanglementSource):
             "max_peers": 8,
             "max_pool_size": 32,
             "supports_fidelity_tracking": False,
+            "supports_prefill": True,
+            "prefill_slots": 0,  # instant generation in test stub
+            "supports_background_refill": True,
         }
 
     async def cleanUp(self):

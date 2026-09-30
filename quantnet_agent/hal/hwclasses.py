@@ -227,6 +227,16 @@ class EntanglementSource(Device):
         -------
         dict
             ``{"continuous_generation": bool, "max_peers": int,
-              "max_pool_size": int, "supports_fidelity_tracking": bool}``
+              "max_pool_size": int, "supports_fidelity_tracking": bool,
+              "supports_prefill": bool, "prefill_slots": int,
+              "supports_background_refill": bool}``
+
+            - ``supports_prefill``: whether the source can pre-generate a pool
+              before circuit execution
+            - ``prefill_slots``: number of TDMA timeslots needed to pre-fill
+              the pool to capacity (0 = instant or not applicable)
+            - ``supports_background_refill``: whether the source autonomously
+              refills consumed pairs during circuit execution, without explicit
+              scheduler control
         """
         pass
