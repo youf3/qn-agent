@@ -121,15 +121,18 @@ class LinkAdjacencyManager:
                 self._publish_state_update(neighbor_cid, LINK_DOWN)
 
     def _publish_state_update(self, neighbor_cid: str, state: str) -> None:
-        # Fire-and-forget publish to monitor topic
+        # Fire-and-forget publish to monitor topic using MonitorEvent format
         try:
-            from quantnet_mq.schema import models
-            event = models.link_adjacency.linkStateUpdate(
-                eventType="link_state_update",
-                src_cid=self._cid,
-                dst_cid=neighbor_cid,
-                state=state,
-                timestamp=datetime.utcnow().isoformat(),
+            from quantnet_mq.schema.models import monitor
+            event = monitor.MonitorEvent(
+                rid=self._cid,
+                ts=datetime.utcnow().timestamp(),
+                eventType="linkStateUpdate",
+                value={
+                    "src_cid": self._cid,
+                    "dst_cid": neighbor_cid,
+                    "state": state,
+                },
             )
             mqtt = self._client._mqttclient
             if mqtt:
