@@ -19,7 +19,7 @@ if os.path.exists(schema_path):
 
 def make_hal(node_type="QNode"):
     hal = MagicMock()
-    hal.config.node_type = node_type
+    hal._config.node_type = node_type
     hal.link_state_table = LinkStateTable()
     return hal
 
@@ -64,12 +64,12 @@ def test_mnode_registers_hello_and_probe():
     assert "link.probe" in cmds
 
 
-def test_opticalswitch_registers_switch_port_check_only():
+def test_opticalswitch_registers_all_commands():
     interp = LinkInterpreter(make_hal("OpticalSwitch"))
     cmds = interp.get_commands()
     assert "link.switchPortCheck" in cmds
-    assert "link.hello" not in cmds
-    assert "link.probe" not in cmds
+    assert "link.hello" in cmds
+    assert "link.probe" in cmds
 
 
 def test_handle_hello_updates_last_received():
@@ -78,8 +78,8 @@ def test_handle_hello_updates_last_received():
     interp = LinkInterpreter(hal)
 
     msg = MagicMock()
-    msg.src_cid = SRC
-    msg.seen_neighbors = []  # our CID not in list yet
+    msg.payload.src_cid = SRC
+    msg.payload.seen_neighbors = []  # our CID not in list yet
 
     asyncio.run(interp.handle_hello(msg))
     entry = hal.link_state_table.get(SRC)
@@ -88,13 +88,13 @@ def test_handle_hello_updates_last_received():
 
 def test_handle_hello_transitions_to_control_up_when_seen():
     hal = make_hal("QNode")
-    hal.config.cid = MY_CID
+    hal._config.cid = MY_CID
     hal.link_state_table.add(SRC, make_entry(LINK_INIT))
     interp = LinkInterpreter(hal)
 
     msg = MagicMock()
-    msg.src_cid = SRC
-    msg.seen_neighbors = [MY_CID]  # neighbor sees us
+    msg.payload.src_cid = SRC
+    msg.payload.seen_neighbors = [MY_CID]  # neighbor sees us
 
     asyncio.run(interp.handle_hello(msg))
     entry = hal.link_state_table.get(SRC)
@@ -103,13 +103,13 @@ def test_handle_hello_transitions_to_control_up_when_seen():
 
 def test_handle_hello_does_not_transition_if_not_seen():
     hal = make_hal("QNode")
-    hal.config.cid = MY_CID
+    hal._config.cid = MY_CID
     hal.link_state_table.add(SRC, make_entry(LINK_INIT))
     interp = LinkInterpreter(hal)
 
     msg = MagicMock()
-    msg.src_cid = SRC
-    msg.seen_neighbors = []  # neighbor does NOT see us yet
+    msg.payload.src_cid = SRC
+    msg.payload.seen_neighbors = []  # neighbor does NOT see us yet
 
     asyncio.run(interp.handle_hello(msg))
     entry = hal.link_state_table.get(SRC)
@@ -120,7 +120,7 @@ def test_handle_probe_returns_ok():
     hal = make_hal("QNode")
     interp = LinkInterpreter(hal)
     msg = MagicMock()
-    msg.src_cid = SRC
+    msg.payload.src_cid = SRC
     result = asyncio.run(interp.handle_probe(msg))
     assert result.status == "ok"
 
@@ -131,7 +131,7 @@ def test_handle_switch_port_check_returns_ok():
     hal.devs = {}
     interp = LinkInterpreter(hal)
     msg = MagicMock()
-    msg.src_channel = "1"
-    msg.dst_channel = "4"
+    msg.payload.src_channel = "1"
+    msg.payload.dst_channel = "4"
     result = asyncio.run(interp.handle_switch_port_check(msg))
     assert result.status in ("ok", "port_down", "not_routed")

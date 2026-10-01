@@ -20,7 +20,7 @@ if os.path.exists(schema_path):
 
 
 MY_CID = "urn:quant-net:LBNL-Q:alice:1"
-NEIGHBOR_CID = "urn:quant-net:LBNL-BSM:alice:4"
+NEIGHBOR_CID = "LBNL-BSM"
 
 
 def make_node_config(neighbor_cid=NEIGHBOR_CID):

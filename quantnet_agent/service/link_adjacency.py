@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import uuid
 from datetime import datetime
 
 from quantnet_mq.rpcclient import RPCClient
@@ -8,6 +9,13 @@ from quantnet_agent.hal.link_state_table import (
     LinkStateTable, LinkEntry,
     LINK_DOWN, LINK_INIT, LINK_CONTROL_UP, LINK_QUANTUM_UP,
 )
+
+# RPC client handler definitions (cmd, callback, classpath)
+_LINK_RPC_HANDLERS = [
+    ("link.hello", None, "quantnet_mq.schema.models.link_adjacency.linkHello"),
+    ("link.probe", None, "quantnet_mq.schema.models.link_adjacency.linkProbe"),
+    ("link.switchPortCheck", None, "quantnet_mq.schema.models.link_adjacency.linkSwitchPortCheck"),
+]
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +30,7 @@ class LinkAdjacencyManager:
         link_state_table: LinkStateTable,
         hello_interval: int = 10,
         hold_time: int = 30,
+        node_status_fn=None,
     ):
         self._cid = cid
         self._node_config = node_config
@@ -32,7 +41,8 @@ class LinkAdjacencyManager:
         self.hold_time = hold_time
         self.is_started = False
         self.registered = False
-        self._client = RPCClient(cid, host=mqhost, port=mqport)
+        self._node_status_fn = node_status_fn
+        self._client = RPCClient(f"{cid}-link", host=mqhost, port=mqport)
         self._neighbors: list[dict] = []
 
     def set_hello_interval(self, n: int) -> None:
@@ -53,7 +63,7 @@ class LinkAdjacencyManager:
         for iface in data.get("matterLightInterfaceSettings", []):
             for ch in iface.get("channels", []):
                 n = ch.get("neighbor", {})
-                ref = n.get("idRef") or n.get("systemRef")
+                ref = n.get("systemRef") or n.get("idRef")
                 if ref and ch.get("direction") == "out":
                     neighbors.append({
                         "neighbor_cid": ref,
@@ -65,7 +75,7 @@ class LinkAdjacencyManager:
         # OpticalSwitch: flat channels array
         for ch in data.get("channels", []):
             n = ch.get("neighbor", {})
-            ref = n.get("idRef") or n.get("systemRef")
+            ref = n.get("systemRef") or n.get("idRef")
             if ref and ch.get("direction") == "out":
                 neighbors.append({
                     "neighbor_cid": ref,
@@ -136,27 +146,42 @@ class LinkAdjacencyManager:
             if e.last_hello_received is not None
         ]
         try:
-            from quantnet_mq.schema import models
-            msg = models.link_adjacency.linkHello(
-                cmd="link.hello",
-                src_cid=self._cid,
-                dst_cid=neighbor_cid,
-                channel_id=entry.channel_id,
-                neighbor_channel_id=entry.neighbor_channel_id,
-                seen_neighbors=seen,
-                hello_interval=self.hello_interval,
-                hold_time=self.hold_time,
-                timestamp=datetime.utcnow().isoformat(),
+            payload = {
+                "src_cid": self._cid,
+                "dst_cid": neighbor_cid,
+                "channel_id": entry.channel_id,
+                "neighbor_channel_id": entry.neighbor_channel_id,
+                "seen_neighbors": seen,
+                "hello_interval": self.hello_interval,
+                "hold_time": self.hold_time,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            resp = await self._client.call(
+                "link.hello", payload, topic=f"rpc/{neighbor_cid}"
             )
-            await self._client.call("link.hello", msg.serialize(), target=f"rpc/{neighbor_cid}")
+            resp = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
             self._table.update(neighbor_cid, last_hello_sent=datetime.utcnow())
             if entry.state == LINK_DOWN:
                 self._table.record_transition(neighbor_cid, LINK_INIT)
         except Exception as e:
-            log.debug("Hello to %s failed: %s", neighbor_cid, e)
+            log.warning("Hello to %s failed: %s", neighbor_cid, e)
 
     async def _probe_if_ready(self) -> None:
-        """After each hello loop tick, check if any link is CONTROL_UP and probe it."""
+        """After each hello loop tick, check if any link is CONTROL_UP and probe it.
+
+        Quantum probes are only attempted when the local agent is IN_SPEC,
+        meaning all calibration tasks have passed.
+        """
+        if self._node_status_fn is not None:
+            from quantnet_agent.hal.local_task_manager import NodeState
+            try:
+                status = self._node_status_fn()
+            except Exception:
+                log.debug("Skipping quantum probe — could not read agent status")
+                return
+            if status is not NodeState.in_spec:
+                log.debug("Skipping quantum probe — agent not IN_SPEC (current: %s)", status.value)
+                return
         for neighbor_cid, entry in self._table.all().items():
             if entry.state != LINK_CONTROL_UP:
                 continue
@@ -169,40 +194,37 @@ class LinkAdjacencyManager:
 
     async def _check_switch(self, switch_cid: str, src_ch: str, dst_ch: str) -> bool:
         try:
-            from quantnet_mq.schema import models
-            msg = models.link_adjacency.linkSwitchPortCheck(
-                cmd="link.switchPortCheck",
-                src_channel=src_ch,
-                dst_channel=dst_ch,
-            )
+            payload = {
+                "src_channel": src_ch,
+                "dst_channel": dst_ch,
+            }
             resp = await self._client.call(
-                "link.switchPortCheck", msg.serialize(), target=f"rpc/{switch_cid}"
+                "link.switchPortCheck", payload, topic=f"rpc/{switch_cid}"
             )
+            resp = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
             return resp.get("status") == "ok"
         except Exception as e:
-            log.debug("Switch check failed: %s", e)
+            log.warning("Switch check failed: %s", e)
             return False
 
     async def _send_probe(self, neighbor_cid: str, entry: LinkEntry) -> None:
-        import uuid
         try:
-            from quantnet_mq.schema import models
-            msg = models.link_adjacency.linkProbe(
-                cmd="link.probe",
-                src_cid=self._cid,
-                dst_cid=neighbor_cid,
-                channel_id=entry.channel_id,
-                probe_id=str(uuid.uuid4()),
-            )
+            payload = {
+                "src_cid": self._cid,
+                "dst_cid": neighbor_cid,
+                "channel_id": entry.channel_id,
+                "probe_id": str(uuid.uuid4()),
+            }
             resp = await self._client.call(
-                "link.probe", msg.serialize(), target=f"rpc/{neighbor_cid}"
+                "link.probe", payload, topic=f"rpc/{neighbor_cid}"
             )
+            resp = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
             if resp and resp.get("status") == "ok":
                 log.info("Probe passed for %s → QUANTUM_UP", neighbor_cid)
                 self._table.record_transition(neighbor_cid, LINK_QUANTUM_UP)
                 self._publish_state_update(neighbor_cid, LINK_QUANTUM_UP)
         except Exception as e:
-            log.debug("Probe to %s failed: %s", neighbor_cid, e)
+            log.warning("Probe to %s failed: %s", neighbor_cid, e)
 
     async def _hello_loop(self) -> None:
         while self.is_started:
@@ -215,6 +237,8 @@ class LinkAdjacencyManager:
     async def start(self) -> None:
         self._neighbors = self._load_neighbors()
         self._init_table()
+        for cmd, cb, classpath in _LINK_RPC_HANDLERS:
+            self._client.set_handler(cmd, cb, classpath)
         await self._client.start()
         # Wait for registration before sending first hello
         while not self.registered:

@@ -1,7 +1,10 @@
 import asyncio
+import ctypes
+import ctypes.util
 import curses
 import logging
 import readline
+import sys
 from datetime import datetime
 
 from quantnet_agent.hal.link_state_table import (
@@ -11,10 +14,11 @@ from quantnet_agent.hal.link_state_table import (
 log = logging.getLogger(__name__)
 
 COMMANDS = [
-    "link show", "link connect", "link disconnect", "link probe",
-    "link set hello-interval", "link set hold-time",
-    "link switch check", "link debug on", "link debug off",
-    "link monitor", "help", "exit", "quit",
+    "show link", "show switch-check",
+    "connect", "disconnect", "probe",
+    "set hello-interval", "set hold-time",
+    "debug link", "no debug link",
+    "monitor", "help", "exit", "quit",
 ]
 
 
@@ -25,6 +29,62 @@ def _make_completer(neighbor_cids, commands):
     return completer
 
 
+def _load_readline_lib():
+    """Load the native readline/libedit shared library for rl_forced_update_display."""
+    try:
+        lib_name = ctypes.util.find_library("readline") or ctypes.util.find_library("edit")
+        if lib_name:
+            return ctypes.cdll.LoadLibrary(lib_name)
+    except OSError:
+        pass
+    return None
+
+
+_rl_lib = _load_readline_lib()
+
+
+class REPLLogHandler(logging.Handler):
+    """Log handler that prints above the readline prompt without corrupting it.
+
+    When a log record arrives while the user is typing, this handler:
+    1. Clears the current terminal line
+    2. Prints the formatted log record
+    3. Asks readline to redraw the prompt and the user's in-progress input
+
+    The ``waiting`` flag must be set to True while the REPL is blocked on
+    ``input()`` and False at all other times.  When False the handler prints
+    the log line normally without redrawing a prompt.
+    """
+
+    def __init__(self, prompt_fn, fmt=None):
+        super().__init__()
+        self._prompt_fn = prompt_fn
+        self.waiting = False
+        if fmt:
+            self.setFormatter(fmt)
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            if self.waiting:
+                # Clear the current line and print the log message
+                sys.stdout.write(f"\r\033[K{msg}\n")
+                sys.stdout.flush()
+                # Ask readline to redraw the prompt + current input buffer
+                if _rl_lib and hasattr(_rl_lib, "rl_forced_update_display"):
+                    _rl_lib.rl_on_new_line()
+                    _rl_lib.rl_forced_update_display()
+                else:
+                    # Fallback: redraw bare prompt (input reappears on next keypress)
+                    sys.stdout.write(self._prompt_fn())
+                    sys.stdout.flush()
+            else:
+                sys.stdout.write(f"{msg}\n")
+                sys.stdout.flush()
+        except Exception:
+            self.handleError(record)
+
+
 class AgentREPL:
     def __init__(self, cid: str, link_mgr, link_state_table):
         self._cid = cid
@@ -32,6 +92,7 @@ class AgentREPL:
         self._table = link_state_table
         self._debug = False
         self._node_name = cid.split(":")[-2] if ":" in cid else cid
+        self._repl_handler = None
 
     def _setup_readline(self):
         neighbor_cids = list(self._table.all().keys())
@@ -43,62 +104,97 @@ class AgentREPL:
     def _prompt(self):
         return f"quantnet-agent [{self._node_name}]> "
 
+    def _install_log_handler(self):
+        """Replace the root logger's stdout handler with a REPL-aware one."""
+        root = logging.getLogger()
+        # Find the existing formatter from the current handler
+        fmt = None
+        for h in root.handlers:
+            if isinstance(h, logging.StreamHandler) and h.stream is sys.stdout:
+                fmt = h.formatter
+                break
+        self._repl_handler = REPLLogHandler(self._prompt, fmt=fmt)
+        self._repl_handler.setLevel(root.level)
+        # Remove stdout handlers, add ours
+        self._original_handlers = []
+        for h in list(root.handlers):
+            if isinstance(h, logging.StreamHandler) and h.stream is sys.stdout:
+                self._original_handlers.append(h)
+                root.removeHandler(h)
+        root.addHandler(self._repl_handler)
+
+    def _uninstall_log_handler(self):
+        """Restore the original log handlers."""
+        if self._repl_handler is None:
+            return
+        root = logging.getLogger()
+        root.removeHandler(self._repl_handler)
+        for h in self._original_handlers:
+            root.addHandler(h)
+        self._repl_handler = None
+        self._original_handlers = []
+
     async def start(self):
         self._setup_readline()
+        self._install_log_handler()
         loop = asyncio.get_event_loop()
         print("\nAgent ready. Type 'help' for commands.\n")
-        while True:
-            try:
-                line = await loop.run_in_executor(
-                    None, lambda: input(self._prompt())
-                )
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-            line = line.strip()
-            if not line:
-                continue
-            if await self._dispatch(line):
-                break  # exit/quit
+        try:
+            while True:
+                try:
+                    self._repl_handler.waiting = True
+                    line = await loop.run_in_executor(
+                        None, lambda: input(self._prompt())
+                    )
+                    self._repl_handler.waiting = False
+                except (EOFError, KeyboardInterrupt):
+                    self._repl_handler.waiting = False
+                    print()
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                if await self._dispatch(line):
+                    break  # exit/quit
+        finally:
+            self._uninstall_log_handler()
 
     async def _dispatch(self, line: str) -> bool:
         parts = line.split()
         if not parts:
             return False
         cmd = parts[0]
+        args = parts[1:]
 
         if cmd in ("exit", "quit"):
             print("Shutting down agent...")
             return True
 
-        if cmd == "help":
+        if cmd == "help" or cmd == "?":
             self._print_help()
-            return False
-
-        if cmd == "link" and len(parts) >= 2:
-            sub = parts[1]
-            args = parts[2:]
-
-            if sub == "show":
-                self._cmd_link_show(args)
-            elif sub == "connect" and args:
-                await self._cmd_link_connect(args[0])
-            elif sub == "disconnect" and args:
-                await self._cmd_link_disconnect(args[0])
-            elif sub == "probe" and args:
-                await self._cmd_link_probe(args[0])
-            elif sub == "set" and len(args) >= 2:
-                self._cmd_link_set(args[0], args[1])
-            elif sub == "switch" and len(args) >= 2 and args[0] == "check":
+        elif cmd == "show":
+            if not args or args[0] == "link":
+                self._cmd_link_show(args[1:])
+            elif args[0] == "switch-check" and len(args) >= 2:
                 await self._cmd_link_switch_check(args[1])
-            elif sub == "debug" and args:
-                self._cmd_link_debug(args[0])
-            elif sub == "monitor":
-                self._cmd_link_monitor()
             else:
-                print(f"Unknown link command: {sub}. Type 'help'.")
+                print(f"Unknown show target: {args[0]}")
+        elif cmd == "connect" and args:
+            await self._cmd_link_connect(args[0])
+        elif cmd == "disconnect" and args:
+            await self._cmd_link_disconnect(args[0])
+        elif cmd == "probe" and args:
+            await self._cmd_link_probe(args[0])
+        elif cmd == "set" and len(args) >= 2:
+            self._cmd_link_set(args[0], args[1])
+        elif cmd == "debug" and args and args[0] == "link":
+            self._cmd_link_debug("on")
+        elif cmd == "no" and len(args) >= 2 and args[0] == "debug" and args[1] == "link":
+            self._cmd_link_debug("off")
+        elif cmd == "monitor":
+            self._cmd_link_monitor()
         else:
-            print(f"Unknown command: {line}. Type 'help'.")
+            print(f"Unknown command: {line}")
 
         return False
 
@@ -261,7 +357,8 @@ class AgentREPL:
 
             for i, (ts, cid, state) in enumerate(events[:h - split - 4]):
                 color = curses.color_pair(STATE_COLOR.get(state, 0))
-                line = f"  {ts.strftime('%H:%M:%S')}  {cid.split(':')[-2]:<20} {state}"
+                short = cid.split(":")[-2] if ":" in cid else cid
+                line = f"  {ts.strftime('%H:%M:%S')}  {short:<20} {state}"
                 stdscr.addstr(split + 2 + i, 0, line[:w-1], color)
 
             stdscr.addstr(h-2, 0, "─" * (w-1))
@@ -273,17 +370,18 @@ class AgentREPL:
 
     def _print_help(self):
         print("""
-Link adjacency commands:
-  link show                      Show all links and their state
-  link show <neighbor_cid>       Detailed view of one link
-  link connect <neighbor_cid>    Manually trigger adjacency
-  link disconnect <neighbor_cid> Bring one link to DOWN
-  link probe <neighbor_cid>      Trigger quantum probe
-  link set hello-interval <n>    Change hello interval (seconds)
-  link set hold-time <n>         Change hold time (seconds)
-  link switch check <neighbor>   Query switch port for a link
-  link debug on|off              Toggle debug logging
-  link monitor                   Live dashboard (q to exit)
+Commands:
+  show link                      Show all links and their state
+  show link <neighbor>           Detailed view of one link
+  show switch-check <neighbor>   Query switch port for a link
+  connect <neighbor>             Trigger link adjacency
+  disconnect <neighbor>          Bring a link to DOWN
+  probe <neighbor>               Trigger quantum probe
+  set hello-interval <n>         Set hello interval (seconds)
+  set hold-time <n>              Set hold time (seconds)
+  debug link                     Enable link debug logging
+  no debug link                  Disable link debug logging
+  monitor                        Live dashboard (q to exit)
   help                           This message
   exit / quit                    Shut down agent
 """)

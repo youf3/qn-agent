@@ -94,6 +94,7 @@ class QuantnetAgent:
             link_state_table=self._link_state_table,
             hello_interval=self.config.link_hello_interval,
             hold_time=self.config.link_hold_time,
+            node_status_fn=lambda: self.node.status,
         )
         asyncio.create_task(self._link_mgr.start())
 
