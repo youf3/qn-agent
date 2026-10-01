@@ -64,12 +64,13 @@ def test_mnode_registers_hello_and_probe():
     assert "link.probe" in cmds
 
 
-def test_opticalswitch_registers_all_commands():
+def test_opticalswitch_registers_switch_and_control():
     interp = LinkInterpreter(make_hal("OpticalSwitch"))
     cmds = interp.get_commands()
     assert "link.switchPortCheck" in cmds
-    assert "link.hello" in cmds
-    assert "link.probe" in cmds
+    assert "link.control" in cmds
+    assert "link.hello" not in cmds
+    assert "link.probe" not in cmds
 
 
 def test_handle_hello_updates_last_received():
