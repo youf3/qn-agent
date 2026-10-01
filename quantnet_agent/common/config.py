@@ -38,6 +38,7 @@ class Config:
         mq_broker_port: int = None,
         interpreter_path: str = None,
         schema_path: str = None,
+        no_repl: bool = False,
     ):
         self.config_file = find_config_file(config_file)
 
@@ -73,6 +74,7 @@ class Config:
             self.proto_plugins = {}
 
         self.schema_path = self._resolve(schema_path, "schemas", "path", None)
+        self.no_repl = no_repl
 
         self.devices = self._parser.get("devices", {}) if self._parser else {}
 

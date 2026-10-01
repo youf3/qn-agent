@@ -85,7 +85,7 @@ class QuantnetAgent:
         self._link_state_table = LinkStateTable()
         self.node.hal.link_state_table = self._link_state_table
 
-        # Create link adjacency manager
+        # Create link adjacency manager (also attached to HAL for link.control RPC)
         self._link_mgr = LinkAdjacencyManager(
             cid=self.config.cid,
             node_config=self.config.node_file,
@@ -96,6 +96,7 @@ class QuantnetAgent:
             hold_time=self.config.link_hold_time,
             node_status_fn=lambda: self.node.status,
         )
+        self.node.hal.link_mgr = self._link_mgr
         asyncio.create_task(self._link_mgr.start())
 
         self._sreg = Register(
@@ -116,9 +117,10 @@ class QuantnetAgent:
         await self.node.start()
         self.started = True
 
-        # Start REPL
-        self._repl = AgentREPL(self.config.cid, self._link_mgr, self._link_state_table)
-        await self._repl.start()
+        # Start interactive REPL (unless --no-repl)
+        if not self.config.no_repl:
+            self._repl = AgentREPL(self.config.cid, self._link_mgr, self._link_state_table)
+            await self._repl.start()
 
     async def main_loop(self) -> None:
         counter = 0
