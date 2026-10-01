@@ -116,10 +116,22 @@ class RemoteREPL:
         print(f"\nConnected to MQTT broker at {self._mq_host}:{self._mq_port}")
         print(f"Target agent: {self._agent_id}")
 
-        # Fetch initial neighbor list
-        await self._refresh_neighbors()
-        if self._neighbor_cids:
-            print(f"Neighbors: {', '.join(self._neighbor_cids)}")
+        # Try to fetch initial neighbor list (non-fatal if agent isn't running yet)
+        # Suppress RPC timeout log noise during initial probe
+        rpc_logger = logging.getLogger("quantnet_mq.rpcclient")
+        prev_level = rpc_logger.level
+        rpc_logger.setLevel(logging.CRITICAL)
+        resp = await self._call_control("show")
+        rpc_logger.setLevel(prev_level)
+        if resp.get("status") == "ok":
+            links = resp.get("data", {}).get("links", {})
+            self._neighbor_cids = list(links.keys())
+            self._setup_readline()
+            if self._neighbor_cids:
+                print(f"Neighbors: {', '.join(self._neighbor_cids)}")
+        else:
+            print("Agent not responding yet (will retry on first command)")
+
         print("\nType 'help' for commands.\n")
 
         self._setup_readline()
