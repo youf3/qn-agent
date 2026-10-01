@@ -292,7 +292,7 @@ class AgentREPL:
             logging.getLogger("quantnet_agent.hal.interpreter.link").setLevel(logging.INFO)
             print("Link debug logging disabled.")
         else:
-            print("Usage: link debug on|off")
+            print("Usage: debug link / no debug link")
 
     def _cmd_link_monitor(self):
         """Enter curses live dashboard mode."""

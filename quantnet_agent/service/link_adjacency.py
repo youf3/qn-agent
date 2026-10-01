@@ -131,9 +131,9 @@ class LinkAdjacencyManager:
                 state=state,
                 timestamp=datetime.utcnow().isoformat(),
             )
-            asyncio.create_task(
-                self._client._msgclient.publish("monitor", event.serialize())
-            )
+            mqtt = self._client._mqttclient
+            if mqtt:
+                mqtt.publish("monitor", event.serialize(), qos=1)
         except Exception as e:
             log.debug("Could not publish link_state_update: %s", e)
 
