@@ -5,8 +5,8 @@ import os
 from datetime import datetime, timedelta
 from quantnet_agent.service.link_adjacency import LinkAdjacencyManager
 from quantnet_agent.hal.link_state_table import (
-    LinkStateTable, LinkEntry,
-    LINK_DOWN, LINK_CONTROL_UP, LINK_QUANTUM_UP,
+    LinkStateTable, LinkEntry, link_key,
+    LINK_DOWN, LINK_INIT, LINK_CONTROL_UP, LINK_QUANTUM_UP,
 )
 
 # Load link_adjacency schema
@@ -19,33 +19,31 @@ if os.path.exists(schema_path):
     Schema.load_schema(schema_path)
 
 
-MY_CID = "urn:quant-net:LBNL-Q:alice:1"
+MY_CID = "LBNL-Q"
 NEIGHBOR_CID = "LBNL-BSM"
+CH_ID = "1"
+NEIGHBOR_CH_ID = "4"
+KEY = link_key(NEIGHBOR_CID, CH_ID)
 
 
-def make_node_config(neighbor_cid=NEIGHBOR_CID):
+def make_node_config(channels=None):
     """Write a minimal node JSON to a temp file and return its path."""
-    data = {
-        "systemSettings": {
-            "cid": MY_CID,
-            "type": "QNode",
-        },
-        "matterLightInterfaceSettings": [
+    if channels is None:
+        channels = [
             {
-                "channels": [
-                    {
-                        "ID": "1",
-                        "type": "quantum",
-                        "direction": "out",
-                        "neighbor": {
-                            "idRef": neighbor_cid,
-                            "systemRef": "LBNL-BSM",
-                            "channelRef": "4",
-                        }
-                    }
-                ]
+                "ID": CH_ID,
+                "type": "quantum",
+                "direction": "out",
+                "neighbor": {
+                    "idRef": NEIGHBOR_CID,
+                    "systemRef": NEIGHBOR_CID,
+                    "channelRef": NEIGHBOR_CH_ID,
+                },
             }
         ]
+    data = {
+        "systemSettings": {"cid": MY_CID, "type": "QNode"},
+        "matterLightInterfaceSettings": [{"channels": channels}],
     }
     f = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
     json.dump(data, f)
@@ -53,9 +51,9 @@ def make_node_config(neighbor_cid=NEIGHBOR_CID):
     return f.name
 
 
-def make_manager(hello_interval=10, hold_time=30):
+def make_manager(hello_interval=10, hold_time=30, channels=None):
     table = LinkStateTable()
-    cfg_path = make_node_config()
+    cfg_path = make_node_config(channels)
     mgr = LinkAdjacencyManager(
         cid=MY_CID,
         node_config=cfg_path,
@@ -95,6 +93,51 @@ def test_load_neighbors_from_config():
     os.unlink(cfg)
     assert len(neighbors) == 1
     assert neighbors[0]["neighbor_cid"] == NEIGHBOR_CID
+    assert neighbors[0]["channel_id"] == CH_ID
+
+
+def test_load_neighbors_multiple_channels_same_neighbor():
+    """Multiple channels to the same neighbor produce separate entries."""
+    channels = [
+        {
+            "ID": "1", "type": "quantum", "direction": "out",
+            "neighbor": {"systemRef": NEIGHBOR_CID, "channelRef": "4"},
+        },
+        {
+            "ID": "2", "type": "quantum", "direction": "out",
+            "neighbor": {"systemRef": NEIGHBOR_CID, "channelRef": "5"},
+        },
+    ]
+    mgr, table, cfg = make_manager(channels=channels)
+    neighbors = mgr._load_neighbors()
+    os.unlink(cfg)
+    assert len(neighbors) == 2
+    assert neighbors[0]["channel_id"] == "1"
+    assert neighbors[1]["channel_id"] == "2"
+
+
+def test_init_table_creates_per_channel_entries():
+    """Each channel gets its own LinkEntry in the table."""
+    channels = [
+        {
+            "ID": "1", "type": "quantum", "direction": "out",
+            "neighbor": {"systemRef": NEIGHBOR_CID, "channelRef": "4"},
+        },
+        {
+            "ID": "2", "type": "quantum", "direction": "out",
+            "neighbor": {"systemRef": NEIGHBOR_CID, "channelRef": "5"},
+        },
+    ]
+    mgr, table, cfg = make_manager(channels=channels)
+    mgr._neighbors = mgr._load_neighbors()
+    mgr._init_table()
+    os.unlink(cfg)
+    key1 = link_key(NEIGHBOR_CID, "1")
+    key2 = link_key(NEIGHBOR_CID, "2")
+    assert table.get(key1) is not None
+    assert table.get(key2) is not None
+    assert table.get(key1).channel_id == "1"
+    assert table.get(key2).channel_id == "2"
 
 
 def test_hold_timer_expires_transitions_to_down():
@@ -107,15 +150,16 @@ def test_hold_timer_expires_transitions_to_down():
         last_hello_sent=datetime.utcnow(),
         last_hello_received=old_time,
         hold_time=30,
-        channel_id="1",
-        neighbor_channel_id="4",
+        neighbor_cid=NEIGHBOR_CID,
+        channel_id=CH_ID,
+        neighbor_channel_id=NEIGHBOR_CH_ID,
         switch_in_path=False,
         switch_cid=None,
         history=[],
     )
-    table.add(NEIGHBOR_CID, entry)
+    table.add(KEY, entry)
     mgr._check_hold_timers()
-    assert table.get(NEIGHBOR_CID).state == LINK_DOWN
+    assert table.get(KEY).state == LINK_DOWN
 
 
 def test_hold_timer_does_not_expire_when_recent():
@@ -127,15 +171,16 @@ def test_hold_timer_does_not_expire_when_recent():
         last_hello_sent=datetime.utcnow(),
         last_hello_received=recent,
         hold_time=30,
-        channel_id="1",
-        neighbor_channel_id="4",
+        neighbor_cid=NEIGHBOR_CID,
+        channel_id=CH_ID,
+        neighbor_channel_id=NEIGHBOR_CH_ID,
         switch_in_path=False,
         switch_cid=None,
         history=[],
     )
-    table.add(NEIGHBOR_CID, entry)
+    table.add(KEY, entry)
     mgr._check_hold_timers()
-    assert table.get(NEIGHBOR_CID).state == LINK_CONTROL_UP
+    assert table.get(KEY).state == LINK_CONTROL_UP
 
 
 def test_disconnect_sets_down():
@@ -146,12 +191,85 @@ def test_disconnect_sets_down():
         last_hello_sent=None,
         last_hello_received=None,
         hold_time=30,
-        channel_id="1",
-        neighbor_channel_id="4",
+        neighbor_cid=NEIGHBOR_CID,
+        channel_id=CH_ID,
+        neighbor_channel_id=NEIGHBOR_CH_ID,
         switch_in_path=False,
         switch_cid=None,
         history=[],
     )
-    table.add(NEIGHBOR_CID, entry)
-    asyncio.run(mgr.disconnect(NEIGHBOR_CID))
-    assert table.get(NEIGHBOR_CID).state == LINK_DOWN
+    table.add(KEY, entry)
+    asyncio.run(mgr.disconnect(KEY))
+    assert table.get(KEY).state == LINK_DOWN
+
+
+def test_hold_timer_per_channel_independent():
+    """Hold timer expiry on one channel doesn't affect another."""
+    mgr, table, cfg = make_manager(hold_time=30)
+    os.unlink(cfg)
+    old_time = datetime.utcnow() - timedelta(seconds=60)
+    recent = datetime.utcnow()
+    key1 = link_key(NEIGHBOR_CID, "1")
+    key2 = link_key(NEIGHBOR_CID, "2")
+    table.add(key1, LinkEntry(
+        state=LINK_CONTROL_UP, last_hello_sent=recent,
+        last_hello_received=old_time, hold_time=30,
+        neighbor_cid=NEIGHBOR_CID, channel_id="1",
+        neighbor_channel_id="4", switch_in_path=False,
+        switch_cid=None, history=[],
+    ))
+    table.add(key2, LinkEntry(
+        state=LINK_CONTROL_UP, last_hello_sent=recent,
+        last_hello_received=recent, hold_time=30,
+        neighbor_cid=NEIGHBOR_CID, channel_id="2",
+        neighbor_channel_id="5", switch_in_path=False,
+        switch_cid=None, history=[],
+    ))
+    mgr._check_hold_timers()
+    assert table.get(key1).state == LINK_DOWN
+    assert table.get(key2).state == LINK_CONTROL_UP
+
+
+def test_init_times_out_when_no_hello_received():
+    """INIT link that never receives a hello should fall back to DOWN
+    after hold_time elapses since entering INIT."""
+    mgr, table, cfg = make_manager(hold_time=30)
+    os.unlink(cfg)
+    old_init = datetime.utcnow() - timedelta(seconds=60)
+    table.add(KEY, LinkEntry(
+        state=LINK_INIT,
+        last_hello_sent=datetime.utcnow(),
+        last_hello_received=None,  # never received
+        hold_time=30,
+        neighbor_cid=NEIGHBOR_CID,
+        channel_id=CH_ID,
+        neighbor_channel_id=NEIGHBOR_CH_ID,
+        switch_in_path=False,
+        switch_cid=None,
+        history=[],
+        init_since=old_init,
+    ))
+    mgr._check_hold_timers()
+    assert table.get(KEY).state == LINK_DOWN
+
+
+def test_init_does_not_timeout_when_recent():
+    """INIT link that just started should stay INIT."""
+    mgr, table, cfg = make_manager(hold_time=30)
+    os.unlink(cfg)
+    now = datetime.utcnow()
+    table.add(KEY, LinkEntry(
+        state=LINK_INIT,
+        last_hello_sent=now,
+        last_hello_received=None,
+        hold_time=30,
+        neighbor_cid=NEIGHBOR_CID,
+        channel_id=CH_ID,
+        neighbor_channel_id=NEIGHBOR_CH_ID,
+        switch_in_path=False,
+        switch_cid=None,
+        history=[],
+        init_since=now,
+    ))
+    mgr._check_hold_timers()
+    assert table.get(KEY).state == LINK_INIT

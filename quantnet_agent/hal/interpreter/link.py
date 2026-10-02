@@ -55,7 +55,7 @@ class LinkInterpreter(CMDInterpreter):
                 entry = table.get(target) if table else None
                 if entry is None:
                     return models.link_adjacency.linkControlResponse(
-                        status="error", data={"message": f"Unknown neighbor: {target}"}
+                        status="error", data={"message": f"Unknown link: {target}"}
                     )
                 data = self._serialize_entry(target, entry)
                 return models.link_adjacency.linkControlResponse(status="ok", data=data)
@@ -72,7 +72,7 @@ class LinkInterpreter(CMDInterpreter):
                 entry = table.get(target) if table else None
                 if entry is None:
                     return models.link_adjacency.linkControlResponse(
-                        status="error", data={"message": f"Unknown neighbor: {target}"}
+                        status="error", data={"message": f"Unknown link: {target}"}
                     )
                 await link_mgr._send_probe(target, entry)
                 return models.link_adjacency.linkControlResponse(status="ok", data={})
@@ -119,9 +119,10 @@ class LinkInterpreter(CMDInterpreter):
         if table is None:
             return {}
         result = {}
-        for cid, entry in table.all().items():
-            result[cid] = {
+        for key, entry in table.all().items():
+            result[key] = {
                 "state": entry.state,
+                "neighbor": entry.neighbor_cid,
                 "channel_id": entry.channel_id,
                 "neighbor_channel_id": entry.neighbor_channel_id,
                 "last_hello_received": entry.last_hello_received.isoformat() if entry.last_hello_received else None,
@@ -132,12 +133,13 @@ class LinkInterpreter(CMDInterpreter):
         return result
 
     @staticmethod
-    def _serialize_entry(cid, entry):
+    def _serialize_entry(key, entry):
         history = []
         for ts, state in entry.history[-20:]:
             history.append({"timestamp": ts.isoformat(), "state": state})
         return {
-            "neighbor": cid,
+            "key": key,
+            "neighbor": entry.neighbor_cid,
             "state": entry.state,
             "channel_id": entry.channel_id,
             "neighbor_channel_id": entry.neighbor_channel_id,
@@ -159,20 +161,39 @@ class LinkInterpreter(CMDInterpreter):
             return models.link_adjacency.linkHelloResponse(status="error")
 
         neighbor_cid = msg.payload.src_cid
-        entry = table.get(neighbor_cid)
-        if entry is None:
-            log.warning("LinkInterpreter: received hello from unknown neighbor %s", neighbor_cid)
+        channel_id = str(msg.payload.neighbor_channel_id)  # their outbound = our inbound
+
+        # Find the matching entry — look up by the remote's channel mapping
+        # The remote sends its channel_id; we need to find our entry whose
+        # neighbor_channel_id matches, or fall back to neighbor-only lookup.
+        key = None
+        for k, e in table.all().items():
+            if e.neighbor_cid == neighbor_cid and e.neighbor_channel_id == channel_id:
+                key = k
+                break
+        if key is None:
+            # Fall back: any entry for this neighbor
+            keys = table.keys_for_neighbor(neighbor_cid)
+            if keys:
+                key = keys[0]
+        if key is None:
+            log.warning("LinkInterpreter: received hello from unknown neighbor %s ch %s", neighbor_cid, channel_id)
             return models.link_adjacency.linkHelloResponse(status="unknown")
 
-        # Update last received timestamp
-        table.update(neighbor_cid, last_hello_received=datetime.utcnow())
+        entry = table.get(key)
+        table.update(key, last_hello_received=datetime.utcnow())
 
         # Check for bilateral confirmation
         my_cid = getattr(self.hal._config, "cid", None)
-        seen = list(msg.payload.seen_neighbors) if msg.payload.seen_neighbors else []
-        if my_cid and my_cid in seen and entry.state == "INIT":
-            log.info("LinkInterpreter: bilateral hello confirmed with %s → CONTROL_UP", neighbor_cid)
-            table.record_transition(neighbor_cid, LINK_CONTROL_UP)
+        seen = [str(s) for s in msg.payload.seen_neighbors] if msg.payload.seen_neighbors else []
+        if my_cid and entry.state == "INIT":
+            # The remote's seen_neighbors contains per-channel keys like
+            # "OUR_CID:THEIR_CH".  Accept if any seen key references us.
+            my_prefix = f"{my_cid}:"
+            if any(s == my_cid or s.startswith(my_prefix) for s in seen):
+                log.info("LinkInterpreter: bilateral hello confirmed %s → CONTROL_UP", key)
+                table.record_transition(key, LINK_CONTROL_UP)
+                table.update(key, init_since=None)
 
         return models.link_adjacency.linkHelloResponse(status="ok")
 
@@ -180,7 +201,7 @@ class LinkInterpreter(CMDInterpreter):
         from quantnet_mq.schema import models
         # Photon probe hardware sequence would go here via hal.devs
         # For now: return ok (dummy / simulation path)
-        log.info("LinkInterpreter: received probe from %s", msg.payload.src_cid)
+        log.info("LinkInterpreter: received probe from %s ch %s", msg.payload.src_cid, msg.payload.channel_id)
         return models.link_adjacency.linkProbeResponse(status="ok")
 
     async def handle_switch_port_check(self, msg):

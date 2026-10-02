@@ -204,30 +204,29 @@ class AgentREPL:
             print("No links configured.")
             return
         if args:
-            neighbor_cid = args[0]
-            entry = self._table.get(neighbor_cid)
+            key = args[0]
+            entry = self._table.get(key)
             if entry is None:
-                print(f"Unknown neighbor: {neighbor_cid}")
+                print(f"Unknown link: {key}")
                 return
-            print(f"\nLink: {neighbor_cid}")
+            print(f"\nLink: {key}")
             print(f"  State:               {entry.state}")
+            print(f"  Neighbor:            {entry.neighbor_cid}")
             print(f"  Channel:             {entry.channel_id} → {entry.neighbor_channel_id}")
             print(f"  Switch in path:      {entry.switch_in_path}")
             print(f"  Hold time:           {entry.hold_time}s")
-            last_rx = entry.last_hello_received
-            print(f"  Last hello RX:       {self._age(last_rx)}")
-            last_tx = entry.last_hello_sent
-            print(f"  Last hello TX:       {self._age(last_tx)}")
+            print(f"  Last hello RX:       {self._age(entry.last_hello_received)}")
+            print(f"  Last hello TX:       {self._age(entry.last_hello_sent)}")
             if entry.history:
                 print("  Recent transitions:")
                 for ts, state in entry.history[-10:]:
                     print(f"    {ts.strftime('%H:%M:%S')}  {state}")
             print()
         else:
-            print(f"\n{'Neighbor':<45} {'State':<14} {'Last RX'}")
-            print("-" * 75)
-            for cid, entry in entries.items():
-                print(f"{cid:<45} {entry.state:<14} {self._age(entry.last_hello_received)}")
+            print(f"\n{'Link':<35} {'State':<14} {'Last RX'}")
+            print("-" * 65)
+            for key, entry in entries.items():
+                print(f"{key:<35} {entry.state:<14} {self._age(entry.last_hello_received)}")
             print()
 
     def _age(self, dt) -> str:
@@ -236,21 +235,21 @@ class AgentREPL:
         secs = (datetime.utcnow() - dt).total_seconds()
         return f"{int(secs)}s ago"
 
-    async def _cmd_link_connect(self, neighbor_cid: str):
-        print(f"Triggering adjacency with {neighbor_cid}...")
-        await self._link_mgr.connect(neighbor_cid)
+    async def _cmd_link_connect(self, target: str):
+        print(f"Triggering adjacency on {target}...")
+        await self._link_mgr.connect(target)
 
-    async def _cmd_link_disconnect(self, neighbor_cid: str):
-        print(f"Disconnecting {neighbor_cid}...")
-        await self._link_mgr.disconnect(neighbor_cid)
+    async def _cmd_link_disconnect(self, target: str):
+        print(f"Disconnecting {target}...")
+        await self._link_mgr.disconnect(target)
 
-    async def _cmd_link_probe(self, neighbor_cid: str):
-        entry = self._table.get(neighbor_cid)
+    async def _cmd_link_probe(self, target: str):
+        entry = self._table.get(target)
         if entry is None:
-            print(f"Unknown neighbor: {neighbor_cid}")
+            print(f"Unknown link: {target}")
             return
-        print(f"Running probe to {neighbor_cid}...")
-        await self._link_mgr._send_probe(neighbor_cid, entry)
+        print(f"Running probe on {target}...")
+        await self._link_mgr._send_probe(target, entry)
 
     def _cmd_link_set(self, param: str, value: str):
         try:
@@ -267,10 +266,10 @@ class AgentREPL:
         else:
             print(f"Unknown parameter: {param}. Use hello-interval or hold-time.")
 
-    async def _cmd_link_switch_check(self, neighbor_cid: str):
-        entry = self._table.get(neighbor_cid)
+    async def _cmd_link_switch_check(self, target: str):
+        entry = self._table.get(target)
         if entry is None:
-            print(f"Unknown neighbor: {neighbor_cid}")
+            print(f"Unknown link: {target}")
             return
         if not entry.switch_in_path or not entry.switch_cid:
             print("No switch in path for this link.")

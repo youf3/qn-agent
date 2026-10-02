@@ -5,10 +5,13 @@ import uuid
 from datetime import datetime
 
 from quantnet_mq.rpcclient import RPCClient
+from quantnet_agent.common.constants import Constants
 from quantnet_agent.hal.link_state_table import (
-    LinkStateTable, LinkEntry,
+    LinkStateTable, LinkEntry, link_key,
     LINK_DOWN, LINK_INIT, LINK_CONTROL_UP, LINK_QUANTUM_UP,
 )
+
+LINK_TOPIC = Constants.LINK_TOPIC_PREFIX
 
 # RPC client handler definitions (cmd, callback, classpath)
 _LINK_RPC_HANDLERS = [
@@ -55,47 +58,46 @@ class LinkAdjacencyManager:
             entry.hold_time = n
 
     def _load_neighbors(self) -> list[dict]:
-        """Parse node config JSON and return list of neighbor dicts."""
+        """Parse node config JSON and return one entry per outbound channel."""
         with open(self._node_config) as f:
             data = json.load(f)
-        neighbors = []
-        # QNode / BSMNode / MNode: channels under matterLightInterfaceSettings
+
+        raw_channels: list[dict] = []
         for iface in data.get("matterLightInterfaceSettings", []):
             for ch in iface.get("channels", []):
-                n = ch.get("neighbor", {})
-                ref = n.get("systemRef") or n.get("idRef")
-                if ref and ch.get("direction") == "out":
-                    neighbors.append({
-                        "neighbor_cid": ref,
-                        "channel_id": ch.get("ID", ""),
-                        "neighbor_channel_id": n.get("channelRef", ""),
-                        "switch_in_path": False,
-                        "switch_cid": None,
-                    })
-        # OpticalSwitch: flat channels array
+                if ch.get("direction") == "out":
+                    raw_channels.append(ch)
         for ch in data.get("channels", []):
+            if ch.get("direction") == "out":
+                raw_channels.append(ch)
+
+        neighbors = []
+        for ch in raw_channels:
             n = ch.get("neighbor", {})
             ref = n.get("systemRef") or n.get("idRef")
-            if ref and ch.get("direction") == "out":
-                neighbors.append({
-                    "neighbor_cid": ref,
-                    "channel_id": ch.get("ID", ""),
-                    "neighbor_channel_id": n.get("channelRef", ""),
-                    "switch_in_path": False,
-                    "switch_cid": None,
-                })
+            if not ref:
+                continue
+            neighbors.append({
+                "neighbor_cid": ref,
+                "channel_id": ch.get("ID", ""),
+                "neighbor_channel_id": n.get("channelRef", ""),
+                "switch_in_path": False,
+                "switch_cid": None,
+            })
         return neighbors
 
     def _init_table(self) -> None:
         for nb in self._neighbors:
-            if self._table.get(nb["neighbor_cid"]) is None:
+            key = link_key(nb["neighbor_cid"], nb["channel_id"])
+            if self._table.get(key) is None:
                 self._table.add(
-                    nb["neighbor_cid"],
+                    key,
                     LinkEntry(
                         state=LINK_DOWN,
                         last_hello_sent=None,
                         last_hello_received=None,
                         hold_time=self.hold_time,
+                        neighbor_cid=nb["neighbor_cid"],
                         channel_id=nb["channel_id"],
                         neighbor_channel_id=nb["neighbor_channel_id"],
                         switch_in_path=nb["switch_in_path"],
@@ -106,21 +108,27 @@ class LinkAdjacencyManager:
 
     def _check_hold_timers(self) -> None:
         now = datetime.utcnow()
-        for neighbor_cid, entry in self._table.all().items():
+        for key, entry in self._table.all().items():
             if entry.state == LINK_DOWN:
                 continue
-            if entry.last_hello_received is None:
+            if entry.last_hello_received is not None:
+                # Normal case: measure from last received hello
+                elapsed = (now - entry.last_hello_received).total_seconds()
+            elif entry.init_since is not None:
+                # INIT with no hello received: measure from when we entered INIT
+                elapsed = (now - entry.init_since).total_seconds()
+            else:
                 continue
-            elapsed = (now - entry.last_hello_received).total_seconds()
             if elapsed > entry.hold_time:
                 log.warning(
                     "Hold timer expired for %s (%.1fs > %ds) → DOWN",
-                    neighbor_cid, elapsed, entry.hold_time,
+                    key, elapsed, entry.hold_time,
                 )
-                self._table.record_transition(neighbor_cid, LINK_DOWN)
-                self._publish_state_update(neighbor_cid, LINK_DOWN)
+                self._table.record_transition(key, LINK_DOWN)
+                self._table.update(key, init_since=None)
+                self._publish_state_update(key, entry, LINK_DOWN)
 
-    def _publish_state_update(self, neighbor_cid: str, state: str) -> None:
+    def _publish_state_update(self, key: str, entry: LinkEntry, state: str) -> None:
         # Fire-and-forget publish to monitor topic using MonitorEvent format
         try:
             from quantnet_mq.schema.models import monitor
@@ -130,7 +138,8 @@ class LinkAdjacencyManager:
                 eventType="linkStateUpdate",
                 value={
                     "src_cid": self._cid,
-                    "dst_cid": neighbor_cid,
+                    "dst_cid": entry.neighbor_cid,
+                    "channel_id": entry.channel_id,
                     "state": state,
                 },
             )
@@ -140,18 +149,18 @@ class LinkAdjacencyManager:
         except Exception as e:
             log.debug("Could not publish link_state_update: %s", e)
 
-    async def _send_hello(self, neighbor_cid: str) -> None:
-        entry = self._table.get(neighbor_cid)
+    async def _send_hello(self, key: str) -> None:
+        entry = self._table.get(key)
         if entry is None:
             return
         seen = [
-            cid for cid, e in self._table.all().items()
+            k for k, e in self._table.all().items()
             if e.last_hello_received is not None
         ]
         try:
             payload = {
                 "src_cid": self._cid,
-                "dst_cid": neighbor_cid,
+                "dst_cid": entry.neighbor_cid,
                 "channel_id": entry.channel_id,
                 "neighbor_channel_id": entry.neighbor_channel_id,
                 "seen_neighbors": seen,
@@ -160,14 +169,15 @@ class LinkAdjacencyManager:
                 "timestamp": datetime.utcnow().isoformat(),
             }
             resp = await self._client.call(
-                "link.hello", payload, topic=f"rpc/{neighbor_cid}"
+                "link.hello", payload, topic=f"{LINK_TOPIC}/{entry.neighbor_cid}"
             )
             resp = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
-            self._table.update(neighbor_cid, last_hello_sent=datetime.utcnow())
+            self._table.update(key, last_hello_sent=datetime.utcnow())
             if entry.state == LINK_DOWN:
-                self._table.record_transition(neighbor_cid, LINK_INIT)
+                self._table.record_transition(key, LINK_INIT)
+                self._table.update(key, init_since=datetime.utcnow())
         except Exception as e:
-            log.warning("Hello to %s failed: %s", neighbor_cid, e)
+            log.warning("Hello to %s failed: %s", key, e)
 
     async def _probe_if_ready(self) -> None:
         """After each hello loop tick, check if any link is CONTROL_UP and probe it.
@@ -185,15 +195,15 @@ class LinkAdjacencyManager:
             if status is not NodeState.in_spec:
                 log.debug("Skipping quantum probe — agent not IN_SPEC (current: %s)", status.value)
                 return
-        for neighbor_cid, entry in self._table.all().items():
+        for key, entry in self._table.all().items():
             if entry.state != LINK_CONTROL_UP:
                 continue
             if entry.switch_in_path and entry.switch_cid:
                 ok = await self._check_switch(entry.switch_cid, entry.channel_id, entry.neighbor_channel_id)
                 if not ok:
-                    log.info("Switch port check failed for %s, staying CONTROL_UP", neighbor_cid)
+                    log.info("Switch port check failed for %s, staying CONTROL_UP", key)
                     continue
-            await self._send_probe(neighbor_cid, entry)
+            await self._send_probe(key, entry)
 
     async def _check_switch(self, switch_cid: str, src_ch: str, dst_ch: str) -> bool:
         try:
@@ -202,7 +212,7 @@ class LinkAdjacencyManager:
                 "dst_channel": dst_ch,
             }
             resp = await self._client.call(
-                "link.switchPortCheck", payload, topic=f"rpc/{switch_cid}"
+                "link.switchPortCheck", payload, topic=f"{LINK_TOPIC}/{switch_cid}"
             )
             resp = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
             return resp.get("status") == "ok"
@@ -210,29 +220,29 @@ class LinkAdjacencyManager:
             log.warning("Switch check failed: %s", e)
             return False
 
-    async def _send_probe(self, neighbor_cid: str, entry: LinkEntry) -> None:
+    async def _send_probe(self, key: str, entry: LinkEntry) -> None:
         try:
             payload = {
                 "src_cid": self._cid,
-                "dst_cid": neighbor_cid,
+                "dst_cid": entry.neighbor_cid,
                 "channel_id": entry.channel_id,
                 "probe_id": str(uuid.uuid4()),
             }
             resp = await self._client.call(
-                "link.probe", payload, topic=f"rpc/{neighbor_cid}"
+                "link.probe", payload, topic=f"{LINK_TOPIC}/{entry.neighbor_cid}"
             )
             resp = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
             if resp and resp.get("status") == "ok":
-                log.info("Probe passed for %s → QUANTUM_UP", neighbor_cid)
-                self._table.record_transition(neighbor_cid, LINK_QUANTUM_UP)
-                self._publish_state_update(neighbor_cid, LINK_QUANTUM_UP)
+                log.info("Probe passed for %s → QUANTUM_UP", key)
+                self._table.record_transition(key, LINK_QUANTUM_UP)
+                self._publish_state_update(key, entry, LINK_QUANTUM_UP)
         except Exception as e:
-            log.warning("Probe to %s failed: %s", neighbor_cid, e)
+            log.warning("Probe to %s failed: %s", key, e)
 
     async def _hello_loop(self) -> None:
         while self.is_started:
-            for neighbor_cid in list(self._table.all().keys()):
-                await self._send_hello(neighbor_cid)
+            for key in list(self._table.all().keys()):
+                await self._send_hello(key)
             self._check_hold_timers()
             await self._probe_if_ready()
             await asyncio.sleep(self.hello_interval)
@@ -247,22 +257,25 @@ class LinkAdjacencyManager:
         while not self.registered:
             await asyncio.sleep(1)
         self.is_started = True
-        log.info("LinkAdjacencyManager started, %d neighbor(s)", len(self._neighbors))
+        log.info("LinkAdjacencyManager started, %d link(s)", len(self._neighbors))
         asyncio.create_task(self._hello_loop())
 
     async def stop(self) -> None:
         self.is_started = False
         log.info("LinkAdjacencyManager stopped")
 
-    async def connect(self, neighbor_cid: str) -> None:
+    async def connect(self, key: str) -> None:
         """Manually trigger adjacency on one link."""
-        entry = self._table.get(neighbor_cid)
+        entry = self._table.get(key)
         if entry and entry.state == LINK_DOWN:
-            self._table.record_transition(neighbor_cid, LINK_INIT)
-        await self._send_hello(neighbor_cid)
+            self._table.record_transition(key, LINK_INIT)
+            self._table.update(key, init_since=datetime.utcnow())
+        await self._send_hello(key)
 
-    async def disconnect(self, neighbor_cid: str) -> None:
+    async def disconnect(self, key: str) -> None:
         """Manually bring one link to DOWN."""
-        if self._table.get(neighbor_cid):
-            self._table.record_transition(neighbor_cid, LINK_DOWN)
-            self._publish_state_update(neighbor_cid, LINK_DOWN)
+        entry = self._table.get(key)
+        if entry:
+            self._table.record_transition(key, LINK_DOWN)
+            self._table.update(key, init_since=None)
+            self._publish_state_update(key, entry, LINK_DOWN)

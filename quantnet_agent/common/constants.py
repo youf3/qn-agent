@@ -20,6 +20,7 @@ class Constants:
     REGISTRATION_RETRY_INTERVAL = 10
     DEFAULT_LINK_HELLO_INTERVAL = 10
     DEFAULT_LINK_HOLD_TIME = 30
+    LINK_TOPIC_PREFIX = "link"  # MQTT topic prefix for agent-to-agent link adjacency traffic
     MAX_TIMESLOTS = 20000
     SLOTSIZE = timedelta(milliseconds=100)
     SCHEDULER_GRACE_PERIOD = timedelta(milliseconds=50)

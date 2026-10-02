@@ -19,6 +19,7 @@ from datetime import datetime
 import click
 import uvloop
 
+from quantnet_agent.common.constants import Constants
 from quantnet_mq.rpcclient import RPCClient
 
 log = logging.getLogger(__name__)
@@ -91,7 +92,7 @@ class RemoteREPL:
             resp = await self._client.call(
                 "link.control",
                 payload,
-                topic=f"rpc/{self._agent_id}",
+                topic=f"{Constants.LINK_TOPIC_PREFIX}/{self._agent_id}",
                 timeout=10.0,
             )
             if isinstance(resp, (str, bytes)):
@@ -209,11 +210,11 @@ class RemoteREPL:
         self._neighbor_cids = list(links.keys())
         self._setup_readline()
 
-        print(f"\n{'Neighbor':<45} {'State':<14} {'Last RX'}")
-        print("-" * 75)
-        for cid, info in links.items():
+        print(f"\n{'Link':<35} {'State':<14} {'Last RX'}")
+        print("-" * 65)
+        for key, info in links.items():
             last_rx = self._format_age(info.get("last_hello_received"))
-            print(f"{cid:<45} {info['state']:<14} {last_rx}")
+            print(f"{key:<35} {info['state']:<14} {last_rx}")
         print()
 
     async def _cmd_show_detail(self, target):
@@ -222,8 +223,9 @@ class RemoteREPL:
             print(f"Error: {resp.get('data', {}).get('message', 'unknown')}")
             return
         data = resp.get("data", {})
-        print(f"\nLink: {data.get('neighbor', target)}")
+        print(f"\nLink: {data.get('key', target)}")
         print(f"  State:               {data.get('state')}")
+        print(f"  Neighbor:            {data.get('neighbor')}")
         print(f"  Channel:             {data.get('channel_id')} → {data.get('neighbor_channel_id')}")
         print(f"  Switch in path:      {data.get('switch_in_path')}")
         print(f"  Hold time:           {data.get('hold_time')}s")

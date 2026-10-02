@@ -7,38 +7,50 @@ LINK_CONTROL_UP = "CONTROL_UP"
 LINK_QUANTUM_UP = "QUANTUM_UP"
 
 
+def link_key(neighbor_cid: str, channel_id: str) -> str:
+    """Build the canonical table key for a per-channel link entry."""
+    return f"{neighbor_cid}:{channel_id}"
+
+
 @dataclass
 class LinkEntry:
     state: str
     last_hello_sent: datetime | None
     last_hello_received: datetime | None
     hold_time: int
+    neighbor_cid: str
     channel_id: str
     neighbor_channel_id: str
     switch_in_path: bool
     switch_cid: str | None
-    history: list = field(default_factory=list)  # list[tuple[datetime, str]]
+    history: list = field(default_factory=list)   # list[tuple[datetime, str]]
+    init_since: datetime | None = field(default=None)  # when link entered INIT
 
 
 class LinkStateTable:
     def __init__(self):
-        self._entries: dict[str, LinkEntry] = {}
+        self._entries: dict[str, LinkEntry] = {}  # key = "neighbor_cid:channel_id"
 
-    def add(self, neighbor_cid: str, entry: LinkEntry) -> None:
-        self._entries[neighbor_cid] = entry
+    def add(self, key: str, entry: LinkEntry) -> None:
+        self._entries[key] = entry
 
-    def get(self, neighbor_cid: str) -> LinkEntry | None:
-        return self._entries.get(neighbor_cid)
+    def get(self, key: str) -> LinkEntry | None:
+        return self._entries.get(key)
 
     def all(self) -> dict[str, LinkEntry]:
         return dict(self._entries)
 
-    def update(self, neighbor_cid: str, **kwargs) -> None:
-        entry = self._entries[neighbor_cid]
+    def update(self, key: str, **kwargs) -> None:
+        entry = self._entries[key]
         for k, v in kwargs.items():
             setattr(entry, k, v)
 
-    def record_transition(self, neighbor_cid: str, new_state: str) -> None:
-        entry = self._entries[neighbor_cid]
+    def record_transition(self, key: str, new_state: str) -> None:
+        entry = self._entries[key]
         entry.state = new_state
         entry.history.append((datetime.utcnow(), new_state))
+
+    def keys_for_neighbor(self, neighbor_cid: str) -> list[str]:
+        """Return all table keys that belong to a given neighbor."""
+        prefix = f"{neighbor_cid}:"
+        return [k for k in self._entries if k.startswith(prefix)]
