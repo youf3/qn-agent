@@ -14,10 +14,11 @@ from quantnet_agent.hal.link_state_table import (
 log = logging.getLogger(__name__)
 
 COMMANDS = [
-    "show link", "show switch-check",
+    "show link", "show logging", "show switch-check",
     "connect", "disconnect", "probe",
     "set hello-interval", "set hold-time",
     "debug link", "no debug link",
+    "logging console", "no logging console",
     "monitor", "help", "exit", "quit",
 ]
 
@@ -91,6 +92,7 @@ class AgentREPL:
         self._link_mgr = link_mgr
         self._table = link_state_table
         self._debug = False
+        self._logging_console_enabled = False  # Hide logging by default (like iOS)
         self._node_name = cid.split(":")[-2] if ":" in cid else cid
         self._repl_handler = None
 
@@ -105,7 +107,11 @@ class AgentREPL:
         return f"quantnet-agent [{self._node_name}]> "
 
     def _install_log_handler(self):
-        """Replace the root logger's stdout handler with a REPL-aware one."""
+        """Replace the root logger's stdout handler with a REPL-aware one.
+
+        By default, logging is hidden (CRITICAL level) to keep the REPL clean.
+        Users can enable it with 'logging console' command.
+        """
         root = logging.getLogger()
         # Find the existing formatter from the current handler
         fmt = None
@@ -114,7 +120,8 @@ class AgentREPL:
                 fmt = h.formatter
                 break
         self._repl_handler = REPLLogHandler(self._prompt, fmt=fmt)
-        self._repl_handler.setLevel(root.level)
+        # Hide logging by default (like iOS): set to CRITICAL to hide all logs
+        self._repl_handler.setLevel(logging.CRITICAL)
         # Remove stdout handlers, add ours
         self._original_handlers = []
         for h in list(root.handlers):
@@ -135,8 +142,11 @@ class AgentREPL:
         self._original_handlers = []
 
     async def start(self):
+        from quantnet_agent.common.logging import clear_buffered_logs
         self._setup_readline()
         self._install_log_handler()
+        # Clear pre-REPL logs so 'show logging' only shows REPL-era activity
+        clear_buffered_logs()
         loop = asyncio.get_event_loop()
         print("\nAgent ready. Type 'help' for commands.\n")
         try:
@@ -175,6 +185,8 @@ class AgentREPL:
         elif cmd == "show":
             if not args or args[0] == "link":
                 self._cmd_link_show(args[1:])
+            elif args[0] == "logging":
+                self._cmd_show_logging()
             elif args[0] == "switch-check" and len(args) >= 2:
                 await self._cmd_link_switch_check(args[1])
             else:
@@ -191,6 +203,10 @@ class AgentREPL:
             self._cmd_link_debug("on")
         elif cmd == "no" and len(args) >= 2 and args[0] == "debug" and args[1] == "link":
             self._cmd_link_debug("off")
+        elif cmd == "logging" and args and args[0] == "console":
+            self._cmd_logging_console("on")
+        elif cmd == "no" and len(args) >= 2 and args[0] == "logging" and args[1] == "console":
+            self._cmd_logging_console("off")
         elif cmd == "monitor":
             self._cmd_link_monitor()
         else:
@@ -209,24 +225,41 @@ class AgentREPL:
             if entry is None:
                 print(f"Unknown link: {key}")
                 return
+            link_type = "quantum" if entry.is_quantum else "classical"
+            if entry.direction == "out":
+                arrow = f"ch {entry.channel_id} (TX) → ch {entry.neighbor_channel_id} (RX)"
+            else:
+                arrow = f"ch {entry.channel_id} (RX) ← ch {entry.neighbor_channel_id} (TX)"
             print(f"\nLink: {key}")
-            print(f"  State:               {entry.state}")
+            if entry.direction == "out":
+                print(f"  State:               {entry.state}")
             print(f"  Neighbor:            {entry.neighbor_cid}")
-            print(f"  Channel:             {entry.channel_id} → {entry.neighbor_channel_id}")
-            print(f"  Switch in path:      {entry.switch_in_path}")
-            print(f"  Hold time:           {entry.hold_time}s")
-            print(f"  Last hello RX:       {self._age(entry.last_hello_received)}")
-            print(f"  Last hello TX:       {self._age(entry.last_hello_sent)}")
-            if entry.history:
-                print("  Recent transitions:")
-                for ts, state in entry.history[-10:]:
-                    print(f"    {ts.strftime('%H:%M:%S')}  {state}")
+            print(f"  Direction:           {arrow}")
+            print(f"  Link type:           {link_type}")
+            if entry.direction == "out":
+                print(f"  Switch in path:      {entry.switch_in_path}")
+                print(f"  Hold time:           {entry.hold_time}s")
+                print(f"  Last hello RX:       {self._age(entry.last_hello_received)}")
+                print(f"  Last hello TX:       {self._age(entry.last_hello_sent)}")
+                if entry.history:
+                    print("  Recent transitions:")
+                    for ts, state in entry.history[-10:]:
+                        print(f"    {ts.strftime('%H:%M:%S')}  {state}")
             print()
         else:
-            print(f"\n{'Link':<35} {'State':<14} {'Last RX'}")
-            print("-" * 65)
+            print(f"\n{'Link':<35} {'State':<14} {'Type':<11} {'Direction':<17} {'Last RX'}")
+            print("-" * 90)
             for key, entry in entries.items():
-                print(f"{key:<35} {entry.state:<14} {self._age(entry.last_hello_received)}")
+                link_type = "quantum" if entry.is_quantum else "classical"
+                if entry.direction == "out":
+                    direction = f"ch{entry.channel_id}→ch{entry.neighbor_channel_id}"
+                    state = entry.state
+                    last_rx = "—"  # Outbound doesn't receive hellos
+                else:
+                    direction = f"ch{entry.channel_id}←ch{entry.neighbor_channel_id}"
+                    state = "—"
+                    last_rx = self._age(entry.last_hello_received)  # Show when last hello arrived
+                print(f"{key:<35} {state:<14} {link_type:<11} {direction:<17} {last_rx}")
             print()
 
     def _age(self, dt) -> str:
@@ -292,6 +325,34 @@ class AgentREPL:
             print("Link debug logging disabled.")
         else:
             print("Usage: debug link / no debug link")
+
+    def _cmd_show_logging(self):
+        """Show current logging console status and buffered logs."""
+        from quantnet_agent.common.logging import get_buffered_logs
+        status = "enabled" if self._logging_console_enabled else "disabled"
+        print(f"Logging to console is {status}.")
+        logs = get_buffered_logs(50)  # Show last 50 logs
+        if logs:
+            print(f"\nRecent logs (last {len(logs)}):")
+            print("-" * 80)
+            for line in logs:
+                print(line)
+            print("-" * 80)
+        else:
+            print("\nNo logs in buffer.")
+
+    def _cmd_logging_console(self, onoff: str):
+        """Enable or disable logging output to console (like iOS 'logging console')."""
+        if onoff == "on":
+            self._logging_console_enabled = True
+            self._repl_handler.setLevel(logging.INFO)
+            print("Logging to console enabled.")
+        elif onoff == "off":
+            self._logging_console_enabled = False
+            self._repl_handler.setLevel(logging.CRITICAL)
+            print("Logging to console disabled.")
+        else:
+            print("Usage: logging console / no logging console")
 
     def _cmd_link_monitor(self):
         """Enter curses live dashboard mode."""
@@ -372,6 +433,7 @@ class AgentREPL:
 Commands:
   show link                      Show all links and their state
   show link <neighbor>           Detailed view of one link
+  show logging                   Show console logging status
   show switch-check <neighbor>   Query switch port for a link
   connect <neighbor>             Trigger link adjacency
   disconnect <neighbor>          Bring a link to DOWN
@@ -380,6 +442,8 @@ Commands:
   set hold-time <n>              Set hold time (seconds)
   debug link                     Enable link debug logging
   no debug link                  Disable link debug logging
+  logging console                Enable logging to console
+  no logging console             Disable logging to console
   monitor                        Live dashboard (q to exit)
   help                           This message
   exit / quit                    Shut down agent

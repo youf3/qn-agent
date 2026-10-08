@@ -20,6 +20,8 @@ def make_entry(**kwargs):
         neighbor_channel_id=CH,
         switch_in_path=False,
         switch_cid=None,
+        is_quantum=True,
+        direction="out",
         history=[],
     )
     defaults.update(kwargs)

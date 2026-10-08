@@ -23,8 +23,12 @@ class LinkEntry:
     neighbor_channel_id: str
     switch_in_path: bool
     switch_cid: str | None
+    is_quantum: bool  # False for classical channels (capped at CONTROL_UP)
+    direction: str    # "out" or "in"; inbound channels are passive (no state)
     history: list = field(default_factory=list)   # list[tuple[datetime, str]]
     init_since: datetime | None = field(default=None)  # when link entered INIT
+    last_published_state: str | None = field(default=None)  # suppress duplicate state updates
+    last_neighbor_hello: datetime | None = field(default=None)  # last hello from neighbor (any inbound channel)
 
 
 class LinkStateTable:

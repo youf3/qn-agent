@@ -44,6 +44,8 @@ def make_entry(state=LINK_DOWN, neighbor_cid="BSM-1_2", channel_id="1",
         neighbor_channel_id=neighbor_channel_id,
         switch_in_path=False,
         switch_cid=None,
+        is_quantum=True,
+        direction="out",
         history=[],
     )
     defaults.update(kwargs)

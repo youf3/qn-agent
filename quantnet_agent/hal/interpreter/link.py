@@ -180,20 +180,30 @@ class LinkInterpreter(CMDInterpreter):
             log.warning("LinkInterpreter: received hello from unknown neighbor %s ch %s", neighbor_cid, channel_id)
             return models.link_adjacency.linkHelloResponse(status="unknown")
 
-        entry = table.get(key)
-        table.update(key, last_hello_received=datetime.utcnow())
+        now = datetime.utcnow()
+        table.update(key, last_hello_received=now)
+
+        # Propagate liveness to all outbound entries for this neighbor
+        # (so hold timers on outbound can detect if neighbor stopped sending)
+        for k, e in table.all().items():
+            if e.neighbor_cid == neighbor_cid and e.direction == "out":
+                table.update(k, last_neighbor_hello=now)
 
         # Check for bilateral confirmation
         my_cid = getattr(self.hal._config, "cid", None)
         seen = [str(s) for s in msg.payload.seen_neighbors] if msg.payload.seen_neighbors else []
-        if my_cid and entry.state == "INIT":
+        if my_cid:
             # The remote's seen_neighbors contains per-channel keys like
             # "OUR_CID:THEIR_CH".  Accept if any seen key references us.
             my_prefix = f"{my_cid}:"
             if any(s == my_cid or s.startswith(my_prefix) for s in seen):
-                log.info("LinkInterpreter: bilateral hello confirmed %s → CONTROL_UP", key)
-                table.record_transition(key, LINK_CONTROL_UP)
-                table.update(key, init_since=None)
+                # Promote all outbound INIT entries for this neighbor to CONTROL_UP
+                # (don't check the receiving entry itself, which may be inbound)
+                for k, e in table.all().items():
+                    if e.neighbor_cid == neighbor_cid and e.direction == "out" and e.state == "INIT":
+                        log.info("LinkInterpreter: bilateral hello confirmed %s → CONTROL_UP", k)
+                        table.record_transition(k, LINK_CONTROL_UP)
+                        table.update(k, init_since=None)
 
         return models.link_adjacency.linkHelloResponse(status="ok")
 

@@ -25,7 +25,7 @@ def make_hal(node_type="QNode"):
 
 
 def make_entry(state=LINK_DOWN, neighbor_cid="LBNL-BSM", channel_id="1",
-               neighbor_channel_id="4"):
+               neighbor_channel_id="4", direction="out"):
     return LinkEntry(
         state=state,
         last_hello_sent=None,
@@ -36,6 +36,8 @@ def make_entry(state=LINK_DOWN, neighbor_cid="LBNL-BSM", channel_id="1",
         neighbor_channel_id=neighbor_channel_id,
         switch_in_path=False,
         switch_cid=None,
+        is_quantum=True,
+        direction=direction,
         history=[],
     )
 
@@ -94,81 +96,159 @@ def test_handle_hello_updates_last_received():
     assert hal.link_state_table.get(KEY).last_hello_received is not None
 
 
-def test_handle_hello_transitions_to_control_up_when_seen_by_key():
-    """Bilateral confirmation works when seen_neighbors contains per-channel keys."""
+def test_handle_hello_propagates_to_outbound_entries():
+    """When hello arrives on inbound channel, propagate timestamp to all outbound
+    entries for the same neighbor (for hold timer liveness on outbound)."""
     hal = make_hal("QNode")
     hal._config.cid = MY_CID
-    entry = make_entry(LINK_INIT, neighbor_cid=SRC, channel_id=MY_CH,
-                       neighbor_channel_id=SRC_CH)
-    hal.link_state_table.add(KEY, entry)
+    # Add one inbound entry (hello arrives on this)
+    inbound_key = link_key(SRC, "2")
+    inbound_entry = make_entry(LINK_DOWN, neighbor_cid=SRC, channel_id="2",
+                               neighbor_channel_id="5", direction="in")
+    hal.link_state_table.add(inbound_key, inbound_entry)
+    # Add two outbound entries (should get last_neighbor_hello updated)
+    outbound_key1 = link_key(SRC, "1")
+    outbound_entry1 = make_entry(LINK_CONTROL_UP, neighbor_cid=SRC, channel_id="1",
+                                 neighbor_channel_id="4", direction="out")
+    hal.link_state_table.add(outbound_key1, outbound_entry1)
+    outbound_key2 = link_key(SRC, "3")
+    outbound_entry2 = make_entry(LINK_CONTROL_UP, neighbor_cid=SRC, channel_id="3",
+                                 neighbor_channel_id="6", direction="out")
+    hal.link_state_table.add(outbound_key2, outbound_entry2)
     interp = LinkInterpreter(hal)
 
     msg = MagicMock()
     msg.payload.src_cid = SRC
-    msg.payload.neighbor_channel_id = SRC_CH
-    # Remote's seen list uses per-channel keys: "OUR_CID:THEIR_CH"
-    msg.payload.seen_neighbors = [f"{MY_CID}:4"]
+    msg.payload.neighbor_channel_id = "5"  # hello on inbound ch2
+    msg.payload.seen_neighbors = []
 
     asyncio.run(interp.handle_hello(msg))
-    assert hal.link_state_table.get(KEY).state == LINK_CONTROL_UP
+    # Inbound entry updated
+    assert hal.link_state_table.get(inbound_key).last_hello_received is not None
+    # Both outbound entries get last_neighbor_hello set
+    assert hal.link_state_table.get(outbound_key1).last_neighbor_hello is not None
+    assert hal.link_state_table.get(outbound_key2).last_neighbor_hello is not None
+
+
+def test_handle_hello_transitions_to_control_up_when_seen_by_key():
+    """Bilateral confirmation works when seen_neighbors contains per-channel keys.
+
+    Simulates: Remote sends hello on inbound channel, carrying seen_neighbors.
+    Should promote all outbound INIT entries for that remote to CONTROL_UP.
+    """
+    hal = make_hal("QNode")
+    hal._config.cid = MY_CID
+    # Add one outbound entry in INIT state (this is what should transition)
+    outbound_key = link_key(SRC, "1")
+    outbound_entry = make_entry(LINK_INIT, neighbor_cid=SRC, channel_id="1",
+                                neighbor_channel_id="4", direction="out")
+    hal.link_state_table.add(outbound_key, outbound_entry)
+    # Add one inbound entry (hello arrives on this)
+    inbound_key = link_key(SRC, "2")
+    inbound_entry = make_entry(LINK_DOWN, neighbor_cid=SRC, channel_id="2",
+                               neighbor_channel_id="5", direction="in")
+    hal.link_state_table.add(inbound_key, inbound_entry)
+    interp = LinkInterpreter(hal)
+
+    # Hello arrives on inbound channel 2
+    msg = MagicMock()
+    msg.payload.src_cid = SRC
+    msg.payload.neighbor_channel_id = "5"  # incoming = their ch 5 = our inbound ch 2
+    # Remote's seen list includes us
+    msg.payload.seen_neighbors = [f"{MY_CID}:1"]
+
+    asyncio.run(interp.handle_hello(msg))
+    # Outbound entry should transition to CONTROL_UP
+    assert hal.link_state_table.get(outbound_key).state == LINK_CONTROL_UP
+    # Inbound entry stays DOWN (passive)
+    assert hal.link_state_table.get(inbound_key).state == LINK_DOWN
 
 
 def test_handle_hello_transitions_to_control_up_when_seen_by_cid():
-    """Backward compat: bilateral confirmation also works with bare CID."""
+    """Backward compat: bilateral confirmation also works with bare CID.
+
+    Same as above but uses just the CID without channel-specific seen entry.
+    """
     hal = make_hal("QNode")
     hal._config.cid = MY_CID
-    entry = make_entry(LINK_INIT, neighbor_cid=SRC, channel_id=MY_CH,
-                       neighbor_channel_id=SRC_CH)
-    hal.link_state_table.add(KEY, entry)
+    # Add one outbound entry in INIT state
+    outbound_key = link_key(SRC, "1")
+    outbound_entry = make_entry(LINK_INIT, neighbor_cid=SRC, channel_id="1",
+                                neighbor_channel_id="4", direction="out")
+    hal.link_state_table.add(outbound_key, outbound_entry)
+    # Add one inbound entry
+    inbound_key = link_key(SRC, "2")
+    inbound_entry = make_entry(LINK_DOWN, neighbor_cid=SRC, channel_id="2",
+                               neighbor_channel_id="5", direction="in")
+    hal.link_state_table.add(inbound_key, inbound_entry)
     interp = LinkInterpreter(hal)
 
+    # Hello arrives on inbound channel
     msg = MagicMock()
     msg.payload.src_cid = SRC
-    msg.payload.neighbor_channel_id = SRC_CH
+    msg.payload.neighbor_channel_id = "5"
+    # Remote's seen list contains just the CID (bare)
     msg.payload.seen_neighbors = [MY_CID]
 
     asyncio.run(interp.handle_hello(msg))
-    assert hal.link_state_table.get(KEY).state == LINK_CONTROL_UP
+    # Outbound entry should still transition to CONTROL_UP
+    assert hal.link_state_table.get(outbound_key).state == LINK_CONTROL_UP
+    # Inbound entry stays DOWN
+    assert hal.link_state_table.get(inbound_key).state == LINK_DOWN
 
 
 def test_handle_hello_does_not_transition_if_not_seen():
+    """Outbound entry stays INIT if neighbor doesn't see us."""
     hal = make_hal("QNode")
     hal._config.cid = MY_CID
-    entry = make_entry(LINK_INIT, neighbor_cid=SRC, channel_id=MY_CH,
-                       neighbor_channel_id=SRC_CH)
-    hal.link_state_table.add(KEY, entry)
+    outbound_key = link_key(SRC, "1")
+    entry = make_entry(LINK_INIT, neighbor_cid=SRC, channel_id="1",
+                       neighbor_channel_id="4", direction="out")
+    hal.link_state_table.add(outbound_key, entry)
     interp = LinkInterpreter(hal)
 
     msg = MagicMock()
     msg.payload.src_cid = SRC
-    msg.payload.neighbor_channel_id = SRC_CH
+    msg.payload.neighbor_channel_id = "4"
     msg.payload.seen_neighbors = []  # neighbor does NOT see us yet
 
     asyncio.run(interp.handle_hello(msg))
-    assert hal.link_state_table.get(KEY).state == LINK_INIT
+    assert hal.link_state_table.get(outbound_key).state == LINK_INIT
 
 
 def test_handle_hello_multiple_channels_independent():
-    """Two channels to the same neighbor have independent state machines."""
+    """Two outbound channels to the same neighbor both transition if in INIT.
+
+    When a hello arrives carrying seen_neighbors, ALL outbound INIT entries
+    for that neighbor promote to CONTROL_UP, not just the matching one.
+    """
     hal = make_hal("QNode")
     hal._config.cid = MY_CID
     key1 = link_key(SRC, "1")
     key2 = link_key(SRC, "2")
+    key_in = link_key(SRC, "3")
+    # Two outbound channels, both INIT
     hal.link_state_table.add(key1, make_entry(LINK_INIT, neighbor_cid=SRC,
-                                              channel_id="1", neighbor_channel_id="4"))
-    hal.link_state_table.add(key2, make_entry(LINK_DOWN, neighbor_cid=SRC,
-                                              channel_id="2", neighbor_channel_id="5"))
+                                              channel_id="1", neighbor_channel_id="4", direction="out"))
+    hal.link_state_table.add(key2, make_entry(LINK_INIT, neighbor_cid=SRC,
+                                              channel_id="2", neighbor_channel_id="5", direction="out"))
+    # One inbound channel (hello arrives on this)
+    hal.link_state_table.add(key_in, make_entry(LINK_DOWN, neighbor_cid=SRC,
+                                                channel_id="3", neighbor_channel_id="6", direction="in"))
     interp = LinkInterpreter(hal)
 
-    # Hello arrives matching channel 1 (neighbor_channel_id="4")
+    # Hello arrives on inbound channel 3, carrying seen_neighbors
     msg = MagicMock()
     msg.payload.src_cid = SRC
-    msg.payload.neighbor_channel_id = "4"
+    msg.payload.neighbor_channel_id = "6"  # matches inbound ch 3
     msg.payload.seen_neighbors = [MY_CID]
 
     asyncio.run(interp.handle_hello(msg))
+    # Both outbound entries should transition
     assert hal.link_state_table.get(key1).state == LINK_CONTROL_UP
-    assert hal.link_state_table.get(key2).state == LINK_DOWN  # untouched
+    assert hal.link_state_table.get(key2).state == LINK_CONTROL_UP
+    # Inbound stays DOWN (passive)
+    assert hal.link_state_table.get(key_in).state == LINK_DOWN
 
 
 def test_handle_probe_returns_ok():

@@ -58,18 +58,19 @@ class LinkAdjacencyManager:
             entry.hold_time = n
 
     def _load_neighbors(self) -> list[dict]:
-        """Parse node config JSON and return one entry per outbound channel."""
+        """Parse node config JSON and return one entry per channel (in and out)."""
         with open(self._node_config) as f:
             data = json.load(f)
 
         raw_channels: list[dict] = []
         for iface in data.get("matterLightInterfaceSettings", []):
             for ch in iface.get("channels", []):
-                if ch.get("direction") == "out":
-                    raw_channels.append(ch)
-        for ch in data.get("channels", []):
-            if ch.get("direction") == "out":
                 raw_channels.append(ch)
+        for ch in data.get("channels", []):
+            raw_channels.append(ch)
+
+        # Channel types that support quantum transmission
+        QUANTUM_TYPES = {"quantum", "heraldedconnection", "quantumconnection"}
 
         neighbors = []
         for ch in raw_channels:
@@ -77,12 +78,15 @@ class LinkAdjacencyManager:
             ref = n.get("systemRef") or n.get("idRef")
             if not ref:
                 continue
+            ch_type = ch.get("type", "quantum").lower()
             neighbors.append({
                 "neighbor_cid": ref,
                 "channel_id": ch.get("ID", ""),
                 "neighbor_channel_id": n.get("channelRef", ""),
                 "switch_in_path": False,
                 "switch_cid": None,
+                "is_quantum": ch_type in QUANTUM_TYPES,
+                "direction": ch.get("direction", "out"),
             })
         return neighbors
 
@@ -102,6 +106,8 @@ class LinkAdjacencyManager:
                         neighbor_channel_id=nb["neighbor_channel_id"],
                         switch_in_path=nb["switch_in_path"],
                         switch_cid=nb["switch_cid"],
+                        is_quantum=nb["is_quantum"],
+                        direction=nb["direction"],
                         history=[],
                     ),
                 )
@@ -109,13 +115,15 @@ class LinkAdjacencyManager:
     def _check_hold_timers(self) -> None:
         now = datetime.utcnow()
         for key, entry in self._table.all().items():
+            if entry.direction == "in":
+                continue  # Inbound channels are passive — no hold timer
             if entry.state == LINK_DOWN:
                 continue
-            if entry.last_hello_received is not None:
-                # Normal case: measure from last received hello
-                elapsed = (now - entry.last_hello_received).total_seconds()
+            # Outbound entries: check last_neighbor_hello (liveness from any inbound)
+            if entry.last_neighbor_hello is not None:
+                elapsed = (now - entry.last_neighbor_hello).total_seconds()
             elif entry.init_since is not None:
-                # INIT with no hello received: measure from when we entered INIT
+                # INIT with no neighbor hello: measure from when we entered INIT
                 elapsed = (now - entry.init_since).total_seconds()
             else:
                 continue
@@ -129,6 +137,9 @@ class LinkAdjacencyManager:
                 self._publish_state_update(key, entry, LINK_DOWN)
 
     def _publish_state_update(self, key: str, entry: LinkEntry, state: str) -> None:
+        # Suppress duplicate state updates (e.g., repeated DOWN from INIT timeout cycles)
+        if state == entry.last_published_state:
+            return
         # Fire-and-forget publish to monitor topic using MonitorEvent format
         try:
             from quantnet_mq.schema.models import monitor
@@ -146,13 +157,25 @@ class LinkAdjacencyManager:
             mqtt = self._client._mqttclient
             if mqtt:
                 mqtt.publish("monitor", event.serialize(), qos=1)
+            # Update last published state after successful publish attempt
+            entry.last_published_state = state
         except Exception as e:
             log.debug("Could not publish link_state_update: %s", e)
+
+    def _publish_pending_updates(self) -> None:
+        """Scan table for state changes that haven't been published yet."""
+        for key, entry in self._table.all().items():
+            if entry.direction == "in":
+                continue
+            if entry.state != entry.last_published_state:
+                self._publish_state_update(key, entry, entry.state)
 
     async def _send_hello(self, key: str) -> None:
         entry = self._table.get(key)
         if entry is None:
             return
+        if entry.direction == "in":
+            return  # Inbound channels are passive — never send hellos
         seen = [
             k for k, e in self._table.all().items()
             if e.last_hello_received is not None
@@ -196,7 +219,13 @@ class LinkAdjacencyManager:
                 log.debug("Skipping quantum probe — agent not IN_SPEC (current: %s)", status.value)
                 return
         for key, entry in self._table.all().items():
+            if entry.direction == "in":
+                continue  # Inbound channels are passive
             if entry.state != LINK_CONTROL_UP:
+                continue
+            # Classical links stay at CONTROL_UP; only quantum links attempt probe
+            if not entry.is_quantum:
+                log.debug("Skipping quantum probe for classical link %s", key)
                 continue
             if entry.switch_in_path and entry.switch_cid:
                 ok = await self._check_switch(entry.switch_cid, entry.channel_id, entry.neighbor_channel_id)
@@ -245,6 +274,7 @@ class LinkAdjacencyManager:
                 await self._send_hello(key)
             self._check_hold_timers()
             await self._probe_if_ready()
+            self._publish_pending_updates()
             await asyncio.sleep(self.hello_interval)
 
     async def start(self) -> None:
