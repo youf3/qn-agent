@@ -14,7 +14,7 @@ from quantnet_agent.hal.link_state_table import (
 log = logging.getLogger(__name__)
 
 COMMANDS = [
-    "show link", "show logging", "show switch-check",
+    "show link", "show logging", "show config", "show switch-check",
     "connect", "disconnect", "probe",
     "set hello-interval", "set hold-time",
     "debug link", "no debug link",
@@ -187,6 +187,8 @@ class AgentREPL:
                 self._cmd_link_show(args[1:])
             elif args[0] == "logging":
                 self._cmd_show_logging()
+            elif args[0] == "config":
+                self._cmd_show_config()
             elif args[0] == "switch-check" and len(args) >= 2:
                 await self._cmd_link_switch_check(args[1])
             else:
@@ -340,6 +342,77 @@ class AgentREPL:
             print("-" * 80)
         else:
             print("\nNo logs in buffer.")
+
+    def _cmd_show_config(self):
+        """Show agent configuration state."""
+        import json
+        cid = self._config.cid if self._config else "N/A"
+
+        print(f"\nAgent Configuration ({cid}):")
+        print("-" * 60)
+
+        # Node info
+        print(f"  Node ID                {cid}")
+        if self._config:
+            print(f"  Worker Threads         {self._config.threads}")
+            broker = f"{self._config.mq_broker_host}:{self._config.mq_broker_port}"
+            print(f"  Message Broker         {broker}")
+
+        # Load node config for qubits and links
+        if self._config and self._config.node_file:
+            try:
+                with open(self._config.node_file) as f:
+                    node_config = json.load(f)
+
+                # Qubits
+                qubit_settings = node_config.get("qubitSettings", {})
+                qubits = qubit_settings.get("qubits", [])
+                if qubits:
+                    print(f"\nQubits ({len(qubits)} total):")
+                    for qubit in qubits:
+                        qubit_id = qubit.get('ID')
+                        qubit_type = qubit.get('quantumObject', 'N/A')
+                        t1 = qubit.get('T1', {}).get('value', 'N/A')
+                        t2 = qubit.get('T2', {}).get('value', 'N/A')
+                        print(f"    Qubit {qubit_id}")
+                        print(f"      Type               {qubit_type}")
+                        print(f"      T1 (decay)         {t1} s")
+                        print(f"      T2 (dephasing)     {t2} s")
+
+                # Channels
+                channels = node_config.get("channels", [])
+                if channels:
+                    print(f"\nChannels ({len(channels)} total):")
+                    print("  " + "-" * 56)
+                    header = f"  {'Ch':<3} {'Type':<14} {'Dir':<5} {'Neighbor':<30}"
+                    print(header)
+                    print("  " + "-" * 56)
+                    for ch in channels:
+                        ch_id = ch.get('ID')
+                        ch_type = ch.get("type", "N/A")
+                        direction = ch.get("direction", "N/A")[:3]
+                        neighbor = ch.get("neighbor", {})
+                        neighbor_sys = neighbor.get("systemRef", "?")
+                        neighbor_ch = neighbor.get("channelRef", "?")
+                        neighbor_str = f"{neighbor_sys}:{neighbor_ch}"
+                        line = f"  {ch_id:<3} {ch_type:<14} {direction:<5} {neighbor_str:<30}"
+                        print(line)
+
+            except (FileNotFoundError, json.JSONDecodeError) as e:
+                print(f"\n  Error loading node config: {e}")
+
+        # Protocol Configuration
+        print("\nLink Adjacency Protocol:")
+        print(f"  Hello Interval         {self._link_mgr.hello_interval} seconds")
+        print(f"  Hold Time              {self._link_mgr.hold_time} seconds")
+
+        # Runtime State
+        print("\nRuntime State:")
+        debug_status = "Enabled" if self._debug else "Disabled"
+        logging_status = "Enabled" if self._logging_console_enabled else "Disabled"
+        print(f"  Debug Mode             {debug_status}")
+        print(f"  Console Logging        {logging_status}")
+        print()
 
     def _cmd_logging_console(self, onoff: str):
         """Enable or disable logging output to console (like iOS 'logging console')."""
