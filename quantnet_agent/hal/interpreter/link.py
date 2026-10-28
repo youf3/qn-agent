@@ -79,8 +79,9 @@ class LinkInterpreter(CMDInterpreter):
                     return models.link_adjacency.linkControlResponse(
                         status="error", data={"message": f"Unknown link: {target}"}
                     )
-                await link_mgr._send_probe(target, entry)
-                return models.link_adjacency.linkControlResponse(status="ok", data={})
+                probe_res = await link_mgr._send_probe(target, entry)
+                data = probe_res if isinstance(probe_res, dict) else {}
+                return models.link_adjacency.linkControlResponse(status="ok", data=data)
 
             elif action == "set":
                 if param == "hello-interval":
@@ -130,10 +131,19 @@ class LinkInterpreter(CMDInterpreter):
                 "neighbor": entry.neighbor_cid,
                 "channel_id": entry.channel_id,
                 "neighbor_channel_id": entry.neighbor_channel_id,
+                "direction": entry.direction,
+                "is_quantum": entry.is_quantum,
                 "last_hello_received": entry.last_hello_received.isoformat() if entry.last_hello_received else None,
                 "last_hello_sent": entry.last_hello_sent.isoformat() if entry.last_hello_sent else None,
                 "hold_time": entry.hold_time,
                 "switch_in_path": entry.switch_in_path,
+                "last_probe_sent": entry.last_probe_sent.isoformat() if entry.last_probe_sent else None,
+                "last_probe_received": entry.last_probe_received.isoformat() if entry.last_probe_received else None,
+                "last_probe_status": entry.last_probe_status,
+                "probe_tx_count": entry.probe_tx_count,
+                "probe_rx_count": entry.probe_rx_count,
+                "probe_ok_count": entry.probe_ok_count,
+                "probe_fail_count": entry.probe_fail_count,
             }
         return result
 
@@ -142,18 +152,33 @@ class LinkInterpreter(CMDInterpreter):
         history = []
         for ts, state in entry.history[-20:]:
             history.append({"timestamp": ts.isoformat(), "state": state})
+        probe_history = []
+        for ts, info in entry.probe_history[-20:]:
+            probe_history.append({"timestamp": ts.isoformat(), **info})
         return {
             "key": key,
             "neighbor": entry.neighbor_cid,
             "state": entry.state,
             "channel_id": entry.channel_id,
             "neighbor_channel_id": entry.neighbor_channel_id,
+            "direction": entry.direction,
+            "is_quantum": entry.is_quantum,
             "last_hello_received": entry.last_hello_received.isoformat() if entry.last_hello_received else None,
             "last_hello_sent": entry.last_hello_sent.isoformat() if entry.last_hello_sent else None,
             "hold_time": entry.hold_time,
             "switch_in_path": entry.switch_in_path,
             "switch_cid": entry.switch_cid,
             "history": history,
+            "last_probe_sent": entry.last_probe_sent.isoformat() if entry.last_probe_sent else None,
+            "last_probe_received": entry.last_probe_received.isoformat() if entry.last_probe_received else None,
+            "last_probe_status": entry.last_probe_status,
+            "last_probe_id": entry.last_probe_id,
+            "probe_tx_count": entry.probe_tx_count,
+            "probe_rx_count": entry.probe_rx_count,
+            "probe_ok_count": entry.probe_ok_count,
+            "probe_fail_count": entry.probe_fail_count,
+            "last_probe_info": dict(entry.last_probe_info) if entry.last_probe_info else {},
+            "probe_history": probe_history,
         }
 
     # ── existing link adjacency handlers ───────────────────────────────
@@ -227,18 +252,25 @@ class LinkInterpreter(CMDInterpreter):
         log.info("LinkInterpreter: received probe from %s ch %s", src_cid, channel_id)
 
         table = getattr(self.hal, "link_state_table", None)
+        in_key = None
         if table is not None and hasattr(table, "all"):
-            matched_entries = [
-                e for e in table.all().values()
-                if e.neighbor_cid == src_cid and str(e.neighbor_channel_id) == channel_id
-            ]
-            if matched_entries and not any(e.direction == "in" for e in matched_entries):
-                log.warning(
-                    "LinkInterpreter: rejecting probe from %s ch %s — matching channel is not inbound ('in')",
-                    src_cid,
-                    channel_id,
-                )
-                return models.link_adjacency.linkProbeResponse(status="error")
+            all_entries = table.all()
+            if isinstance(all_entries, dict):
+                matched_items = [
+                    (k, e) for k, e in all_entries.items()
+                    if e.neighbor_cid == src_cid and str(e.neighbor_channel_id) == channel_id
+                ]
+                for k, e in matched_items:
+                    if e.direction == "in":
+                        in_key = k
+                        break
+                if matched_items and in_key is None:
+                    log.warning(
+                        "LinkInterpreter: rejecting probe from %s ch %s — matching channel is not inbound ('in')",
+                        src_cid,
+                        channel_id,
+                    )
+                    return models.link_adjacency.linkProbeResponse(status="error")
 
         devs = getattr(self.hal, "devs", None)
         sig_dev = devs.get("signalmeasurement") if isinstance(devs, dict) else None
@@ -250,14 +282,57 @@ class LinkInterpreter(CMDInterpreter):
                 probe_id=probe_id,
             )
             if not isinstance(res, dict) or not res.get("detected"):
+                reason = res.get("reason") if isinstance(res, dict) else "no_detection"
+                if in_key is not None and hasattr(table, "record_probe"):
+                    table.record_probe(
+                        in_key,
+                        {
+                            "direction": "in",
+                            "key": in_key,
+                            "probe_id": probe_id or "",
+                            "status": str(reason or "error"),
+                            "detected": False,
+                            "counts": 0,
+                            "reason": str(reason or "no_detection"),
+                        },
+                    )
                 log.warning(
                     "LinkInterpreter: time-tagger did not detect quantum probe %s from %s ch %s (%s)",
                     probe_id,
                     src_cid,
                     channel_id,
-                    res.get("reason") if isinstance(res, dict) else "no_detection",
+                    reason,
                 )
                 return models.link_adjacency.linkProbeResponse(status="error")
+
+            if in_key is not None and hasattr(table, "record_probe"):
+                table.record_probe(
+                    in_key,
+                    {
+                        "direction": "in",
+                        "key": in_key,
+                        "probe_id": probe_id or str(res.get("probe_id", "")),
+                        "status": "ok",
+                        "detected": True,
+                        "counts": res.get("counts", 1),
+                        "tof": res.get("tof", 0.0),
+                        "wavelength": res.get("wavelength"),
+                        "power": res.get("power"),
+                        "vlink": res.get("vlink", ""),
+                    },
+                )
+        elif in_key is not None and hasattr(table, "record_probe"):
+            table.record_probe(
+                in_key,
+                {
+                    "direction": "in",
+                    "key": in_key,
+                    "probe_id": probe_id or "",
+                    "status": "ok",
+                    "detected": True,
+                    "counts": 1,
+                },
+            )
 
         return models.link_adjacency.linkProbeResponse(status="ok")
 

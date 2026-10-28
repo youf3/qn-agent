@@ -161,12 +161,54 @@ class TestLinkControlActions:
         hal = make_hal()
         entry = make_entry(LINK_CONTROL_UP)
         hal.link_state_table.add(KEY_A, entry)
+        hal.link_mgr._send_probe = AsyncMock(
+            return_value={
+                "direction": "out",
+                "probe_id": "abc12345",
+                "status": "ok",
+                "vlink": "QPU-1:1->BSM-1_2:4",
+                "rtt_ms": 1.2,
+            }
+        )
         interp = LinkInterpreter(hal)
 
         msg = make_control_msg("probe", target=KEY_A)
         resp = asyncio.run(interp.handle_control(msg))
-        assert resp.as_dict()["status"] == "ok"
+        res_dict = resp.as_dict()
+        assert res_dict["status"] == "ok"
+        assert res_dict["data"]["probe_id"] == "abc12345"
+        assert res_dict["data"]["status"] == "ok"
         hal.link_mgr._send_probe.assert_awaited_once()
+
+    def test_show_and_show_detail_include_probe_telemetry(self):
+        hal = make_hal()
+        entry = make_entry(LINK_QUANTUM_UP)
+        hal.link_state_table.add(KEY_A, entry)
+        hal.link_state_table.record_probe(
+            KEY_A,
+            {
+                "direction": "out",
+                "probe_id": "p9999999",
+                "status": "ok",
+                "rtt_ms": 0.9,
+            },
+        )
+        interp = LinkInterpreter(hal)
+
+        show_resp = asyncio.run(interp.handle_control(make_control_msg("show"))).as_dict()
+        link_summary = show_resp["data"]["links"][KEY_A]
+        assert link_summary["probe_tx_count"] == 1
+        assert link_summary["probe_ok_count"] == 1
+        assert link_summary["last_probe_status"] == "ok"
+
+        detail_resp = asyncio.run(
+            interp.handle_control(make_control_msg("show_detail", target=KEY_A))
+        ).as_dict()
+        detail = detail_resp["data"]
+        assert detail["probe_tx_count"] == 1
+        assert detail["probe_ok_count"] == 1
+        assert detail["last_probe_id"] == "p9999999"
+        assert len(detail["probe_history"]) == 1
 
     def test_probe_unknown_target_returns_error(self):
         hal = make_hal()

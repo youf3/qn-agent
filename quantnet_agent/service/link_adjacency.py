@@ -1,12 +1,13 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime
 
 from quantnet_mq.rpcclient import RPCClient
 from quantnet_agent.common.constants import Constants
-from quantnet_agent.hal.hwclasses import LightSrc
+from quantnet_agent.hal.hwclasses import LightSrc, SignalMeasurement
 from quantnet_agent.hal.link_state_table import (
     LinkStateTable, LinkEntry, link_key,
     LINK_DOWN, LINK_INIT, LINK_CONTROL_UP, LINK_QUANTUM_UP,
@@ -59,6 +60,15 @@ class LinkAdjacencyManager:
             return None
         dev = devs.get("lightsource")
         return dev if isinstance(dev, LightSrc) else None
+
+    def _get_signalmeasurement(self):
+        if self._hal is None:
+            return None
+        devs = getattr(self._hal, "devs", None)
+        if not isinstance(devs, dict):
+            return None
+        dev = devs.get("signalmeasurement")
+        return dev if isinstance(dev, SignalMeasurement) else None
 
     def set_hello_interval(self, n: int) -> None:
         self.hello_interval = n
@@ -261,17 +271,38 @@ class LinkAdjacencyManager:
             log.warning("Switch check failed: %s", e)
             return False
 
-    async def _send_probe(self, key: str, entry: LinkEntry) -> None:
+    async def _send_probe(self, key: str, entry: LinkEntry) -> dict:
         if entry.direction != "out":
             log.warning("Cannot send probe on non-outbound channel %s (direction=%s)", key, entry.direction)
-            return
+            return {
+                "status": "skipped",
+                "reason": f"non-outbound channel (direction={entry.direction})",
+                "key": key,
+                "direction": entry.direction,
+            }
         if not entry.is_quantum:
             log.debug("Skipping quantum probe on non-quantum channel %s", key)
-            return
+            return {
+                "status": "skipped",
+                "reason": "non-quantum channel",
+                "key": key,
+                "direction": entry.direction,
+            }
+        vlink_info = {}
+        probe_id = str(uuid.uuid4())
         try:
-            probe_id = str(uuid.uuid4())
             lightsource = self._get_lightsource()
             if lightsource is not None:
+                if hasattr(lightsource, "get_outbound_vlink"):
+                    vlink = lightsource.get_outbound_vlink(entry.channel_id, dst_cid=entry.neighbor_cid)
+                    if vlink is not None:
+                        vlink_info = {
+                            "vlink": vlink.vlink_id,
+                            "peer_ip": vlink.peer_ip,
+                            "port": vlink.port,
+                            "wavelength": vlink.wavelength,
+                            "power": vlink.power,
+                        }
                 rc = await lightsource.generate(
                     "H",
                     channel_id=entry.channel_id,
@@ -280,7 +311,17 @@ class LinkAdjacencyManager:
                 )
                 if rc != 0:
                     log.warning("LightSrc failed to emit probe for %s", key)
-                    return
+                    info = {
+                        "direction": "out",
+                        "key": key,
+                        "probe_id": probe_id,
+                        "status": "tx_failed",
+                        "reason": "lightsource_generate_failed",
+                        "state": entry.state,
+                        **vlink_info,
+                    }
+                    self._table.record_probe(key, info)
+                    return info
 
             payload = {
                 "src_cid": self._cid,
@@ -288,16 +329,54 @@ class LinkAdjacencyManager:
                 "channel_id": entry.channel_id,
                 "probe_id": probe_id,
             }
+            t0 = time.monotonic()
             resp = await self._client.call(
                 "link.probe", payload, topic=f"{LINK_TOPIC}/{entry.neighbor_cid}"
             )
+            rtt_ms = round((time.monotonic() - t0) * 1000.0, 2)
             resp = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
             if resp and resp.get("status") == "ok":
                 log.info("Probe passed for %s → QUANTUM_UP", key)
                 self._table.record_transition(key, LINK_QUANTUM_UP)
                 self._publish_state_update(key, entry, LINK_QUANTUM_UP)
+                info = {
+                    "direction": "out",
+                    "key": key,
+                    "probe_id": probe_id,
+                    "status": "ok",
+                    "rtt_ms": rtt_ms,
+                    "state": LINK_QUANTUM_UP,
+                    **vlink_info,
+                }
+                self._table.record_probe(key, info)
+                return info
+
+            remote_status = resp.get("status", "error") if isinstance(resp, dict) else "error"
+            info = {
+                "direction": "out",
+                "key": key,
+                "probe_id": probe_id,
+                "status": remote_status,
+                "reason": "remote_rejected",
+                "rtt_ms": rtt_ms,
+                "state": entry.state,
+                **vlink_info,
+            }
+            self._table.record_probe(key, info)
+            return info
         except Exception as e:
             log.warning("Probe to %s failed: %s", key, e)
+            info = {
+                "direction": "out",
+                "key": key,
+                "probe_id": probe_id,
+                "status": "rpc_error",
+                "reason": str(e),
+                "state": entry.state,
+                **vlink_info,
+            }
+            self._table.record_probe(key, info)
+            return info
 
     async def _hello_loop(self) -> None:
         while self.is_started:

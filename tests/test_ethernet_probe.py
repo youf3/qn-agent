@@ -21,6 +21,7 @@ from quantnet_agent.hal.link_state_table import (
     LINK_QUANTUM_UP,
 )
 from quantnet_agent.service.link_adjacency import LinkAdjacencyManager
+from quantnet_agent.service.repl import AgentREPL, _make_completer
 from quantnet_mq.schema.models import Schema
 
 SCHEMA_PATH = os.path.abspath(
@@ -310,9 +311,21 @@ class TestEndToEndLinkProbeProcess:
 
                 mgr_a._client.call = AsyncMock(side_effect=route_rpc)
 
-                await mgr_a._send_probe(key_a, entry_a)
+                res = await mgr_a._send_probe(key_a, entry_a)
 
+                assert res["status"] == "ok"
                 assert table_a.get(key_a).state == LINK_QUANTUM_UP
+                assert table_a.get(key_a).probe_tx_count == 1
+                assert table_a.get(key_a).probe_ok_count == 1
+                assert table_a.get(key_a).last_probe_status == "ok"
+                assert table_a.get(key_a).last_probe_info["wavelength"] == 1550.0
+
+                key_b = link_key("NodeA", "ch_in_1")
+                assert table_b.get(key_b).probe_rx_count == 1
+                assert table_b.get(key_b).probe_ok_count == 1
+                assert table_b.get(key_b).last_probe_status == "ok"
+                assert table_b.get(key_b).last_probe_info["detected"] is True
+                assert table_b.get(key_b).last_probe_info["counts"] == 1
             finally:
                 await sig_b.cleanUp()
 
@@ -325,8 +338,9 @@ class TestEndToEndLinkProbeProcess:
             sig_b = DummySignalMeasurement(props_b, path_b, "localhost", 1883)
             try:
                 table_b = LinkStateTable()
+                key_b = link_key("NodeA", "ch_in_1")
                 table_b.add(
-                    link_key("NodeA", "ch_in_1"),
+                    key_b,
                     _make_entry(LINK_DOWN, "NodeA", "ch_in_1", "ch_out_1", direction="in"),
                 )
 
@@ -345,6 +359,9 @@ class TestEndToEndLinkProbeProcess:
                 msg.payload.probe_id = "dropped-optical-pulse"
                 resp = await interp_b.handle_probe(msg)
                 assert resp.status == "error"
+                assert table_b.get(key_b).probe_rx_count == 1
+                assert table_b.get(key_b).probe_fail_count == 1
+                assert table_b.get(key_b).last_probe_status == "timeout"
             finally:
                 await sig_b.cleanUp()
 
@@ -376,9 +393,185 @@ class TestEndToEndLinkProbeProcess:
             )
             mgr_a._client.call = AsyncMock()
 
-            await mgr_a._send_probe(key_a, entry_a)
+            res = await mgr_a._send_probe(key_a, entry_a)
 
+            assert res["status"] == "tx_failed"
             mgr_a._client.call.assert_not_called()
             assert table_a.get(key_a).state == LINK_CONTROL_UP
+            assert table_a.get(key_a).probe_tx_count == 1
+            assert table_a.get(key_a).probe_fail_count == 1
+            assert table_a.get(key_a).last_probe_status == "tx_failed"
 
         asyncio.run(_run())
+
+
+class TestREPLProbeMonitoring:
+    """Verify interactive REPL commands for quantum probe monitoring."""
+
+    def test_show_probe_summary_and_detail(self, tmp_path, capsys):
+        async def _run():
+            path_a, path_b = _write_pair_configs(tmp_path)
+            props = {"ip": "127.0.0.1", "base_port": "21200", "window": "0.5"}
+            light_a = DummyLightSrc(props, path_a, "localhost", 1883)
+            sig_a = DummySignalMeasurement(props, path_a, "localhost", 1883)
+            try:
+                table_a = LinkStateTable()
+                key_out = link_key("NodeB", "ch_out_1")
+                key_in = link_key("NodeB", "ch_in_2")
+                entry_out = _make_entry(
+                    LINK_QUANTUM_UP, "NodeB", "ch_out_1", "ch_in_1", direction="out"
+                )
+                entry_in = _make_entry(
+                    LINK_DOWN, "NodeB", "ch_in_2", "ch_out_2", direction="in"
+                )
+                table_a.add(key_out, entry_out)
+                table_a.add(key_in, entry_in)
+
+                table_a.record_probe(
+                    key_out,
+                    {
+                        "direction": "out",
+                        "probe_id": "abc12345",
+                        "status": "ok",
+                        "vlink": "NodeA:ch_out_1->NodeB:ch_in_1",
+                        "peer_ip": "127.0.0.1",
+                        "port": 21201,
+                        "wavelength": 1550.0,
+                        "power": 10.5,
+                        "rtt_ms": 2.4,
+                        "reason": None,
+                    },
+                )
+                table_a.record_probe(
+                    key_in,
+                    {
+                        "direction": "in",
+                        "probe_id": "def67890",
+                        "status": "ok",
+                        "detected": True,
+                        "counts": 1,
+                        "tof": 1.2e-03,
+                        "wavelength": 1310.0,
+                        "power": 8.0,
+                        "vlink": "NodeB:ch_out_2->NodeA:ch_in_2",
+                        "reason": None,
+                    },
+                )
+
+                hal_a = MagicMock()
+                hal_a._config.cid = "NodeA"
+                hal_a.link_state_table = table_a
+                hal_a.devs = {"lightsource": light_a, "signalmeasurement": sig_a}
+
+                mgr_a = LinkAdjacencyManager(
+                    cid="NodeA",
+                    node_config=path_a,
+                    mqhost="localhost",
+                    mqport=1883,
+                    link_state_table=table_a,
+                    hal=hal_a,
+                )
+
+                repl = AgentREPL("NodeA", mgr_a, table_a)
+
+                # 1. Summary: show probe
+                repl._dispatch("show probe")
+                out = capsys.readouterr().out
+                assert "Hardware Probe Drivers: LightSrc=DummyLightSrc" in out
+                assert "SignalMeasurement=DummySignalMeasurement" in out
+                assert key_out in out
+                assert key_in in out
+                assert "TX:1" in out
+                assert "RX:1" in out
+
+                # 2. Detail outbound: show probe NodeB:ch_out_1
+                repl._dispatch(f"show probe {key_out}")
+                out_detail = capsys.readouterr().out
+                assert f"Quantum Probe Status: {key_out}" in out_detail
+                assert "NodeA:ch_out_1->NodeB:ch_in_1" in out_detail
+                assert "wavelength=1550.0 nm, power=10.5 dBm" in out_detail
+                assert "abc12345" in out_detail
+
+                # 3. Detail inbound: show probe NodeB:ch_in_2
+                repl._dispatch(f"show probe {key_in}")
+                in_detail = capsys.readouterr().out
+                assert f"Quantum Probe Status: {key_in}" in in_detail
+                assert "Photon Counts:     1" in in_detail
+                assert "def67890" in in_detail
+
+                # 4. Enriched show link <key>
+                repl._dispatch(f"show link {key_out}")
+                link_detail = capsys.readouterr().out
+                assert "Probe TX / OK / Fail: 1 / 1 / 0" in link_detail
+            finally:
+                await sig_a.cleanUp()
+
+        asyncio.run(_run())
+
+    def test_interactive_probe_command_and_debug_toggle(self, capsys):
+        async def _run():
+            table = LinkStateTable()
+            key = link_key("NodeB", "ch_out_1")
+            entry = _make_entry(LINK_CONTROL_UP, "NodeB", "ch_out_1", "ch_in_1", direction="out")
+            table.add(key, entry)
+
+            mgr = MagicMock()
+            mgr._send_probe = AsyncMock(
+                return_value={
+                    "direction": "out",
+                    "probe_id": "p1122334",
+                    "status": "ok",
+                    "vlink": "NodeA:ch_out_1->NodeB:ch_in_1",
+                    "wavelength": 1550.0,
+                    "power": 10.5,
+                    "rtt_ms": 1.8,
+                    "reason": None,
+                }
+            )
+
+            repl = AgentREPL("NodeA", mgr, table)
+            await repl._cmd_link_probe(key, ["2"])
+            out = capsys.readouterr().out
+            assert "[1/2] Running quantum probe" in out
+            assert "[2/2] Running quantum probe" in out
+            assert "[PASS] probe_id=p1122334" in out
+            assert mgr._send_probe.await_count == 2
+
+            repl._dispatch("debug probe")
+            assert repl._debug_probe is True
+            repl._dispatch("no debug probe")
+            assert repl._debug_probe is False
+
+            # Verify tab completer includes show probe & debug probe
+            completer = _make_completer(table)
+            with patch("readline.get_line_buffer", return_value="show probe "):
+                assert completer("NodeB", 0) == key
+
+        asyncio.run(_run())
+
+    def test_render_probe_dashboard_writes_to_curses_window(self):
+        table = LinkStateTable()
+        key = link_key("NodeB", "ch_out_1")
+        entry = _make_entry(LINK_QUANTUM_UP, "NodeB", "ch_out_1", "ch_in_1", direction="out")
+        table.add(key, entry)
+        table.record_probe(
+            key,
+            {
+                "direction": "out",
+                "probe_id": "dash1234",
+                "status": "ok",
+                "vlink": "NodeA:ch_out_1->NodeB:ch_in_1",
+                "wavelength": 1550.0,
+                "power": 10.5,
+                "rtt_ms": 1.5,
+            },
+        )
+        repl = AgentREPL("NodeA", MagicMock(), table)
+        stdscr = MagicMock()
+        with patch("curses.color_pair", return_value=0), patch("curses.A_BOLD", 1), patch(
+            "curses.A_REVERSE", 2
+        ):
+            repl._render_probe_dashboard(stdscr, 24, 100, "2026-10-28 15:00:00", {})
+        rendered = " ".join(str(call.args[2]) for call in stdscr.addstr.call_args_list if len(call.args) >= 3)
+        assert "Quantum Probe Monitor" in rendered
+        assert "dash1234" in rendered
