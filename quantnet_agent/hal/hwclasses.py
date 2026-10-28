@@ -94,8 +94,18 @@ class SignalMeasurement(Device):
     def __init__(self, *args, **kwargs):
         super().__init__(args, kwargs)
 
+    @property
     @abstractmethod
-    def measure(self):
+    def window(self):
+        pass
+
+    @window.setter
+    @abstractmethod
+    def window(self, value):
+        pass
+
+    @abstractmethod
+    async def measure(self, *args, **kwargs):
         pass
 
 

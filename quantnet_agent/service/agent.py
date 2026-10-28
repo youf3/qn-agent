@@ -141,6 +141,7 @@ class QuantnetAgent:
             hello_interval=self.config.link_hello_interval,
             hold_time=self.config.link_hold_time,
             node_status_fn=lambda: self.node.status,
+            hal=self.node.hal,
         )
         self.node.hal.link_mgr = self._link_mgr
         asyncio.create_task(self._link_mgr.start())
@@ -181,6 +182,10 @@ class QuantnetAgent:
 
     async def shutdown(self) -> None:
         log.info("Shutting down")
+        if hasattr(self, "node") and getattr(self.node, "hal", None) is not None:
+            sig_dev = self.node.hal.devs.get("signalmeasurement")
+            if sig_dev is not None and hasattr(sig_dev, "cleanUp"):
+                await sig_dev.cleanUp()
 
     def get_node(self, node_type):
         nodes_module = importlib.import_module("quantnet_agent.hal.node")

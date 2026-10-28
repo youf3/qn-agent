@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime
 from quantnet_agent.hal.HAL import CMDInterpreter
+from quantnet_agent.hal.hwclasses import SignalMeasurement
 from quantnet_agent.hal.link_state_table import LINK_CONTROL_UP
 
 log = logging.getLogger(__name__)
@@ -39,10 +40,14 @@ class LinkInterpreter(CMDInterpreter):
     async def handle_control(self, msg):
         from quantnet_mq.schema import models
 
-        action = msg.payload.action
-        target = getattr(msg.payload, "target", None)
-        param = getattr(msg.payload, "param", None)
-        value = getattr(msg.payload, "value", None)
+        raw_action = getattr(msg.payload, "action", None)
+        action = str(raw_action) if raw_action is not None else None
+        raw_target = getattr(msg.payload, "target", None)
+        target = str(raw_target) if raw_target is not None else None
+        raw_param = getattr(msg.payload, "param", None)
+        param = str(raw_param) if raw_param is not None else None
+        raw_value = getattr(msg.payload, "value", None)
+        value = int(raw_value) if raw_value is not None else None
         table = getattr(self.hal, "link_state_table", None)
         link_mgr = getattr(self.hal, "link_mgr", None)
 
@@ -209,9 +214,51 @@ class LinkInterpreter(CMDInterpreter):
 
     async def handle_probe(self, msg):
         from quantnet_mq.schema import models
-        # Photon probe hardware sequence would go here via hal.devs
-        # For now: return ok (dummy / simulation path)
-        log.info("LinkInterpreter: received probe from %s ch %s", msg.payload.src_cid, msg.payload.channel_id)
+
+        src_cid = str(getattr(msg.payload, "src_cid", ""))
+        dst_cid = getattr(msg.payload, "dst_cid", None)
+        if not isinstance(dst_cid, str):
+            dst_cid = None
+        channel_id = str(getattr(msg.payload, "channel_id", ""))
+        probe_id = getattr(msg.payload, "probe_id", None)
+        if not isinstance(probe_id, str):
+            probe_id = None
+
+        log.info("LinkInterpreter: received probe from %s ch %s", src_cid, channel_id)
+
+        table = getattr(self.hal, "link_state_table", None)
+        if table is not None and hasattr(table, "all"):
+            matched_entries = [
+                e for e in table.all().values()
+                if e.neighbor_cid == src_cid and str(e.neighbor_channel_id) == channel_id
+            ]
+            if matched_entries and not any(e.direction == "in" for e in matched_entries):
+                log.warning(
+                    "LinkInterpreter: rejecting probe from %s ch %s — matching channel is not inbound ('in')",
+                    src_cid,
+                    channel_id,
+                )
+                return models.link_adjacency.linkProbeResponse(status="error")
+
+        devs = getattr(self.hal, "devs", None)
+        sig_dev = devs.get("signalmeasurement") if isinstance(devs, dict) else None
+        if isinstance(sig_dev, SignalMeasurement):
+            res = await sig_dev.measure(
+                src_cid=src_cid,
+                dst_cid=dst_cid,
+                channel_id=channel_id,
+                probe_id=probe_id,
+            )
+            if not isinstance(res, dict) or not res.get("detected"):
+                log.warning(
+                    "LinkInterpreter: time-tagger did not detect quantum probe %s from %s ch %s (%s)",
+                    probe_id,
+                    src_cid,
+                    channel_id,
+                    res.get("reason") if isinstance(res, dict) else "no_detection",
+                )
+                return models.link_adjacency.linkProbeResponse(status="error")
+
         return models.link_adjacency.linkProbeResponse(status="ok")
 
     async def handle_switch_port_check(self, msg):

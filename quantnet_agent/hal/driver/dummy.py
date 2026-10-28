@@ -1,21 +1,197 @@
-from quantnet_agent.hal.hwclasses import LightSrc, Filter, LightMeasurement, ExpFramework
-import logging
+from quantnet_agent.hal.hwclasses import (
+    LightSrc,
+    Filter,
+    LightMeasurement,
+    SignalMeasurement,
+    ExpFramework,
+)
+from collections import deque
+from dataclasses import dataclass
 import asyncio
+import json
+import logging
+import os
 import random
+import socket
+import time
+import zlib
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class VirtualLinkEndpoint:
+    """Directional virtual link endpoint created on top of the configured emulation IP."""
+
+    vlink_id: str
+    direction: str
+    local_ch: str
+    src_cid: str
+    src_ch: str
+    dst_cid: str
+    dst_ch: str
+    local_ip: str
+    peer_ip: str
+    port: int
+    wavelength: float = 1550.0
+    power: float = 0.0
+    ch_type: str = "quantum"
+
+
+def _extract_wavelength(raw_wl) -> float:
+    if isinstance(raw_wl, dict):
+        val = raw_wl.get("value", 1550.0)
+        return float(val) if val is not None else 1550.0
+    if isinstance(raw_wl, (int, float, str)):
+        try:
+            return float(raw_wl)
+        except ValueError:
+            return 1550.0
+    return 1550.0
+
+
+def _extract_power(raw_power) -> float:
+    if isinstance(raw_power, dict):
+        val = raw_power.get("value", 0.0)
+        return float(val) if val is not None else 0.0
+    if isinstance(raw_power, (int, float, str)):
+        try:
+            return float(raw_power)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _parse_peer_ips(raw_peer_ips) -> dict:
+    if not raw_peer_ips:
+        return {}
+    if isinstance(raw_peer_ips, dict):
+        return {str(k): str(v) for k, v in raw_peer_ips.items()}
+    peer_map = {}
+    items = raw_peer_ips if isinstance(raw_peer_ips, list) else str(raw_peer_ips).split(",")
+    for item in items:
+        item_str = str(item).strip()
+        if ":" in item_str:
+            cid, ip_addr = item_str.split(":", 1)
+            peer_map[cid.strip()] = ip_addr.strip()
+    return peer_map
+
+
+def parse_virtual_links(
+    node_file,
+    ip: str = "127.0.0.1",
+    base_port: int = 15000,
+    port_range: int = 10000,
+    peer_ips=None,
+):
+    """Parse a node definition JSON and construct outbound and inbound virtual links on top of `ip`."""
+    if not node_file:
+        return "", {}, {}
+
+    if isinstance(node_file, dict):
+        data = node_file
+    elif isinstance(node_file, str) and os.path.isfile(node_file):
+        with open(node_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        return "", {}, {}
+
+    sys_settings = data.get("systemSettings", {})
+    local_cid = str(sys_settings.get("ID") or sys_settings.get("cid") or "")
+    if not local_cid:
+        return "", {}, {}
+
+    peer_ip_map = _parse_peer_ips(peer_ips)
+    raw_channels = []
+    for mli in data.get("matterLightInterfaceSettings", []):
+        if isinstance(mli, dict):
+            raw_channels.extend(mli.get("channels", []))
+    raw_channels.extend(data.get("channels", []))
+
+    outbound = {}
+    inbound = {}
+    seen = set()
+
+    for ch in raw_channels:
+        if not isinstance(ch, dict):
+            continue
+        local_ch = str(ch.get("ID") or "")
+        direction = str(ch.get("direction") or "")
+        ch_type = str(ch.get("type") or "quantum")
+        neighbor = ch.get("neighbor")
+        if not local_ch or direction not in ("out", "in") or not isinstance(neighbor, dict):
+            continue
+
+        neighbor_cid = str(neighbor.get("systemRef") or neighbor.get("idRef") or "")
+        neighbor_ch = str(neighbor.get("channelRef") or "")
+        if not neighbor_cid or not neighbor_ch:
+            continue
+
+        dedup_key = (direction, local_ch, neighbor_cid, neighbor_ch)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        if direction == "out":
+            src_cid, src_ch = local_cid, local_ch
+            dst_cid, dst_ch = neighbor_cid, neighbor_ch
+        else:
+            src_cid, src_ch = neighbor_cid, neighbor_ch
+            dst_cid, dst_ch = local_cid, local_ch
+
+        vlink_id = f"{src_cid}:{src_ch}->{dst_cid}:{dst_ch}"
+        port = base_port + (zlib.crc32(vlink_id.encode("utf-8")) % port_range)
+        peer_ip = peer_ip_map.get(neighbor_cid, ip)
+
+        endpoint = VirtualLinkEndpoint(
+            vlink_id=vlink_id,
+            direction=direction,
+            local_ch=local_ch,
+            src_cid=src_cid,
+            src_ch=src_ch,
+            dst_cid=dst_cid,
+            dst_ch=dst_ch,
+            local_ip=ip,
+            peer_ip=peer_ip,
+            port=port,
+            wavelength=_extract_wavelength(ch.get("wavelength")),
+            power=_extract_power(ch.get("power")),
+            ch_type=ch_type,
+        )
+        if direction == "out":
+            outbound[(dst_cid, local_ch)] = endpoint
+        else:
+            inbound[(src_cid, src_ch)] = endpoint
+
+    return local_cid, outbound, inbound
 
 
 class DummyLightSrc(LightSrc):
 
     def __init__(self, *args, **kwargs):
         super().__init__(args, kwargs)
+        props = args[0] if len(args) > 0 and isinstance(args[0], dict) else {}
+        node_file = args[1] if len(args) > 1 else None
         self._power = 0
         self._wavelength = 0
         self._status = 0
-        self._failrate = float(args[0].get("failrate", 0))
-        log.info("Initializing Dummy Lightsource")
-        return
+        self._failrate = float(props.get("failrate", 0))
+        self._ip = str(props.get("ip", "127.0.0.1"))
+        self._base_port = int(props.get("base_port", 15000))
+        self._port_range = int(props.get("port_range", 10000))
+        self._cid, self._outbound_links, _ = parse_virtual_links(
+            node_file,
+            ip=self._ip,
+            base_port=self._base_port,
+            port_range=self._port_range,
+            peer_ips=props.get("peer_ips"),
+        )
+        log.info(
+            "Initializing DummyLightSrc (ip=%s, base_port=%d, outbound_vlinks=%d)",
+            self._ip,
+            self._base_port,
+            len(self._outbound_links),
+        )
 
     @property
     def wavelength(self):
@@ -35,15 +211,74 @@ class DummyLightSrc(LightSrc):
         log.info(f"Setting power to {power}")
         self._power = power
 
-    async def generate(self, pol):
-        log.info(f"Generating {pol} light with to power = {self._power}, wavelength = {self._wavelength}")
-        if random.random() < self._failrate:
-            log.error("Light source failed")
+    def get_outbound_vlink(self, channel_id: str, dst_cid: str = None):
+        ch_str = str(channel_id)
+        if dst_cid is not None:
+            vlink = self._outbound_links.get((str(dst_cid), ch_str))
+            if vlink is not None:
+                return vlink
+        for (_, local_ch), vlink in self._outbound_links.items():
+            if local_ch == ch_str:
+                return vlink
+        return None
+
+    async def generate(self, pol="H", channel_id=None, dst_cid=None, probe_id=None):
+        if channel_id is None and probe_id is None:
+            log.info(f"Generating {pol} light with to power = {self._power}, wavelength = {self._wavelength}")
+            if random.random() < self._failrate:
+                log.error("Light source failed")
+                return 1
+            else:
+                log.info("Calibrating for 10 sec")
+                await asyncio.sleep(10)
+                return 0
+
+        vlink = self.get_outbound_vlink(channel_id=str(channel_id), dst_cid=dst_cid)
+        if vlink is None:
+            log.warning(
+                "DummyLightSrc: no outbound ('out') virtual link for channel=%s dst=%s on %s",
+                channel_id,
+                dst_cid,
+                self._cid,
+            )
             return 1
-        else:
-            log.info("Calibrating for 10 sec")
-            await asyncio.sleep(10)
+
+        if random.random() < self._failrate:
+            log.error("DummyLightSrc failed to emit probe on %s", vlink.vlink_id)
+            return 1
+
+        self.wavelength = vlink.wavelength
+        self.power = vlink.power
+        payload = {
+            "vlink": vlink.vlink_id,
+            "probe_id": str(probe_id),
+            "src_cid": vlink.src_cid,
+            "dst_cid": vlink.dst_cid,
+            "src_ch": vlink.src_ch,
+            "dst_ch": vlink.dst_ch,
+            "wavelength": self._wavelength,
+            "power": self._power,
+            "pol": pol,
+            "tx_ts": time.time(),
+        }
+        data = json.dumps(payload).encode("utf-8")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setblocking(False)
+            sock.sendto(data, (vlink.peer_ip, vlink.port))
+            log.debug(
+                "DummyLightSrc emitted quantum probe %s over %s (%s:%d)",
+                probe_id,
+                vlink.vlink_id,
+                vlink.peer_ip,
+                vlink.port,
+            )
             return 0
+        except OSError as exc:
+            log.warning("DummyLightSrc UDP send failed on %s: %s", vlink.vlink_id, exc)
+            return 1
+        finally:
+            sock.close()
 
     async def cleanUp(self):
         self._status = 0
@@ -54,6 +289,193 @@ class DummyLightSrc(LightSrc):
     @property
     def status(self):
         return self._status
+
+
+class DummySignalMeasurement(SignalMeasurement):
+    """Emulates a single-photon detector + Time-Tagger on inbound ('in') virtual links."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(args, kwargs)
+        props = args[0] if len(args) > 0 and isinstance(args[0], dict) else {}
+        node_file = args[1] if len(args) > 1 else None
+        self._status = 0
+        self._ip = str(props.get("ip", "127.0.0.1"))
+        self._base_port = int(props.get("base_port", 15000))
+        self._port_range = int(props.get("port_range", 10000))
+        self._window = float(props.get("window", props.get("timeout", 2.0)))
+        self._resolution = float(props.get("resolution", 100e-9))
+        self._efficiency = float(props.get("efficiency", 1.0))
+
+        self._cid, _, self._inbound_links = parse_virtual_links(
+            node_file,
+            ip=self._ip,
+            base_port=self._base_port,
+            port_range=self._port_range,
+            peer_ips=props.get("peer_ips"),
+        )
+        self._sockets = {}
+        self._timetags = {}
+        self._bind_inbound_sockets()
+        log.info(
+            "Initializing DummySignalMeasurement time-tagger (ip=%s, base_port=%d, inbound_vlinks=%d, window=%.2fs)",
+            self._ip,
+            self._base_port,
+            len(self._inbound_links),
+            self._window,
+        )
+
+    def _bind_inbound_sockets(self):
+        for key, vlink in self._inbound_links.items():
+            self._timetags[key] = deque(maxlen=256)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "SO_REUSEPORT"):
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                    except OSError:
+                        pass
+                sock.setblocking(False)
+                sock.bind((vlink.local_ip, vlink.port))
+                self._sockets[key] = sock
+            except OSError as exc:
+                log.warning(
+                    "DummySignalMeasurement failed to bind UDP socket for %s on %s:%d: %s",
+                    vlink.vlink_id,
+                    vlink.local_ip,
+                    vlink.port,
+                    exc,
+                )
+                sock.close()
+
+    @property
+    def window(self):
+        return self._window
+
+    @window.setter
+    def window(self, value):
+        self._window = float(value)
+
+    @property
+    def resolution(self):
+        return self._resolution
+
+    def _drain_socket(self, key, vlink: VirtualLinkEndpoint):
+        sock = self._sockets.get(key)
+        if sock is None:
+            return
+        buf = self._timetags[key]
+        while True:
+            try:
+                raw, _ = sock.recvfrom(4096)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+
+            rx_ts = time.time()
+            try:
+                msg = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("vlink") != vlink.vlink_id:
+                continue
+            if str(msg.get("dst_cid")) != vlink.dst_cid:
+                continue
+            if str(msg.get("src_cid")) != vlink.src_cid or str(msg.get("src_ch")) != vlink.src_ch:
+                continue
+
+            tx_ts = float(msg.get("tx_ts", rx_ts))
+            buf.append(
+                {
+                    "probe_id": str(msg.get("probe_id", "")),
+                    "vlink": vlink.vlink_id,
+                    "src_cid": vlink.src_cid,
+                    "dst_cid": vlink.dst_cid,
+                    "src_ch": vlink.src_ch,
+                    "dst_ch": vlink.dst_ch,
+                    "wavelength": float(msg.get("wavelength", vlink.wavelength)),
+                    "power": float(msg.get("power", vlink.power)),
+                    "pol": msg.get("pol", "H"),
+                    "tx_ts": tx_ts,
+                    "rx_ts": rx_ts,
+                    "tof": max(0.0, rx_ts - tx_ts),
+                }
+            )
+
+    async def measure(self, src_cid=None, dst_cid=None, channel_id=None, probe_id=None, timeout=None):
+        key = (str(src_cid), str(channel_id))
+        vlink = self._inbound_links.get(key)
+        if vlink is None or (dst_cid is not None and str(dst_cid) != self._cid):
+            log.warning(
+                "DummySignalMeasurement: no inbound ('in') virtual link for src=%s ch=%s on %s",
+                src_cid,
+                channel_id,
+                self._cid,
+            )
+            return {
+                "detected": False,
+                "counts": 0,
+                "reason": "invalid_inbound_channel",
+            }
+
+        coincidence_window = float(timeout) if timeout is not None else self._window
+        deadline = time.monotonic() + coincidence_window
+        target_probe = str(probe_id) if probe_id is not None else None
+        buf = self._timetags[key]
+
+        while True:
+            self._drain_socket(key, vlink)
+            now = time.time()
+            while buf and (now - buf[0]["rx_ts"]) > max(coincidence_window, self._window):
+                buf.popleft()
+
+            for idx, tag in enumerate(buf):
+                if target_probe is None or tag["probe_id"] == target_probe:
+                    del buf[idx]
+                    if random.random() > self._efficiency:
+                        return {
+                            "detected": False,
+                            "counts": 0,
+                            "reason": "detector_inefficiency",
+                        }
+                    return {
+                        "detected": True,
+                        "counts": 1,
+                        "probe_id": tag["probe_id"],
+                        "vlink": vlink.vlink_id,
+                        "channel_id": vlink.dst_ch,
+                        "rx_ts": tag["rx_ts"],
+                        "tx_ts": tag["tx_ts"],
+                        "tof": tag["tof"],
+                        "wavelength": tag["wavelength"],
+                        "power": tag["power"],
+                    }
+
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.02)
+
+        return {
+            "detected": False,
+            "counts": 0,
+            "reason": "timeout",
+        }
+
+    async def cleanUp(self):
+        self._status = 0
+        for sock in self._sockets.values():
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self._sockets.clear()
+        for buf in self._timetags.values():
+            buf.clear()
+        return 0
 
 
 class DummyEPC(Filter):

@@ -6,6 +6,7 @@ from datetime import datetime
 
 from quantnet_mq.rpcclient import RPCClient
 from quantnet_agent.common.constants import Constants
+from quantnet_agent.hal.hwclasses import LightSrc
 from quantnet_agent.hal.link_state_table import (
     LinkStateTable, LinkEntry, link_key,
     LINK_DOWN, LINK_INIT, LINK_CONTROL_UP, LINK_QUANTUM_UP,
@@ -34,6 +35,7 @@ class LinkAdjacencyManager:
         hello_interval: int = 10,
         hold_time: int = 30,
         node_status_fn=None,
+        hal=None,
     ):
         self._cid = cid
         self._node_config = node_config
@@ -45,8 +47,18 @@ class LinkAdjacencyManager:
         self.is_started = False
         self.registered = False
         self._node_status_fn = node_status_fn
+        self._hal = hal
         self._client = RPCClient(f"{cid}-link", host=mqhost, port=mqport)
         self._neighbors: list[dict] = []
+
+    def _get_lightsource(self):
+        if self._hal is None:
+            return None
+        devs = getattr(self._hal, "devs", None)
+        if not isinstance(devs, dict):
+            return None
+        dev = devs.get("lightsource")
+        return dev if isinstance(dev, LightSrc) else None
 
     def set_hello_interval(self, n: int) -> None:
         self.hello_interval = n
@@ -250,12 +262,31 @@ class LinkAdjacencyManager:
             return False
 
     async def _send_probe(self, key: str, entry: LinkEntry) -> None:
+        if entry.direction != "out":
+            log.warning("Cannot send probe on non-outbound channel %s (direction=%s)", key, entry.direction)
+            return
+        if not entry.is_quantum:
+            log.debug("Skipping quantum probe on non-quantum channel %s", key)
+            return
         try:
+            probe_id = str(uuid.uuid4())
+            lightsource = self._get_lightsource()
+            if lightsource is not None:
+                rc = await lightsource.generate(
+                    "H",
+                    channel_id=entry.channel_id,
+                    dst_cid=entry.neighbor_cid,
+                    probe_id=probe_id,
+                )
+                if rc != 0:
+                    log.warning("LightSrc failed to emit probe for %s", key)
+                    return
+
             payload = {
                 "src_cid": self._cid,
                 "dst_cid": entry.neighbor_cid,
                 "channel_id": entry.channel_id,
-                "probe_id": str(uuid.uuid4()),
+                "probe_id": probe_id,
             }
             resp = await self._client.call(
                 "link.probe", payload, topic=f"{LINK_TOPIC}/{entry.neighbor_cid}"
