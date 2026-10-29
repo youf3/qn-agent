@@ -8,6 +8,7 @@ from quantnet_agent.hal.hwclasses import (
 from collections import deque
 from dataclasses import dataclass
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -62,18 +63,38 @@ def _extract_power(raw_power) -> float:
     return 0.0
 
 
+def _normalize_ip(ip_addr: str) -> str:
+    s = str(ip_addr).strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1].strip()
+    return s
+
+
+def _udp_socket_family(ip_addr: str) -> socket.AddressFamily:
+    try:
+        addr = ipaddress.ip_address(_normalize_ip(ip_addr).split("%", 1)[0])
+        return socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+    except ValueError:
+        return socket.AF_INET6 if ":" in str(ip_addr) else socket.AF_INET
+
+
 def _parse_peer_ips(raw_peer_ips) -> dict:
     if not raw_peer_ips:
         return {}
     if isinstance(raw_peer_ips, dict):
-        return {str(k): str(v) for k, v in raw_peer_ips.items()}
+        return {str(k).strip(): _normalize_ip(v) for k, v in raw_peer_ips.items()}
     peer_map = {}
     items = raw_peer_ips if isinstance(raw_peer_ips, list) else str(raw_peer_ips).split(",")
     for item in items:
         item_str = str(item).strip()
-        if ":" in item_str:
+        if not item_str:
+            continue
+        if "=" in item_str:
+            cid, ip_addr = item_str.split("=", 1)
+            peer_map[cid.strip()] = _normalize_ip(ip_addr)
+        elif ":" in item_str:
             cid, ip_addr = item_str.split(":", 1)
-            peer_map[cid.strip()] = ip_addr.strip()
+            peer_map[cid.strip()] = _normalize_ip(ip_addr)
     return peer_map
 
 
@@ -85,6 +106,7 @@ def parse_virtual_links(
     peer_ips=None,
 ):
     """Parse a node definition JSON and construct outbound and inbound virtual links on top of `ip`."""
+    ip = _normalize_ip(ip)
     if not node_file:
         return "", {}, {}
 
@@ -176,7 +198,7 @@ class DummyLightSrc(LightSrc):
         self._wavelength = 0
         self._status = 0
         self._failrate = float(props.get("failrate", 0))
-        self._ip = str(props.get("ip", "127.0.0.1"))
+        self._ip = _normalize_ip(props.get("ip", "127.0.0.1"))
         self._base_port = int(props.get("base_port", 15000))
         self._port_range = int(props.get("port_range", 10000))
         self._cid, self._outbound_links, _ = parse_virtual_links(
@@ -262,7 +284,7 @@ class DummyLightSrc(LightSrc):
             "tx_ts": time.time(),
         }
         data = json.dumps(payload).encode("utf-8")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock = socket.socket(_udp_socket_family(vlink.peer_ip), socket.SOCK_DGRAM)
         try:
             sock.setblocking(False)
             sock.sendto(data, (vlink.peer_ip, vlink.port))
@@ -299,7 +321,7 @@ class DummySignalMeasurement(SignalMeasurement):
         props = args[0] if len(args) > 0 and isinstance(args[0], dict) else {}
         node_file = args[1] if len(args) > 1 else None
         self._status = 0
-        self._ip = str(props.get("ip", "127.0.0.1"))
+        self._ip = _normalize_ip(props.get("ip", "127.0.0.1"))
         self._base_port = int(props.get("base_port", 15000))
         self._port_range = int(props.get("port_range", 10000))
         self._window = float(props.get("window", props.get("timeout", 2.0)))
@@ -327,7 +349,7 @@ class DummySignalMeasurement(SignalMeasurement):
     def _bind_inbound_sockets(self):
         for key, vlink in self._inbound_links.items():
             self._timetags[key] = deque(maxlen=256)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock = socket.socket(_udp_socket_family(vlink.local_ip), socket.SOCK_DGRAM)
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 if hasattr(socket, "SO_REUSEPORT"):

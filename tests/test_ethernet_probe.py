@@ -250,6 +250,49 @@ class TestLightSrcAndTimeTaggerEmulation:
 
         asyncio.run(_run())
 
+    def test_emit_and_detect_ipv6_quantum_probe_timetag(self, tmp_path):
+        async def _run():
+            path_a, path_b = _write_pair_configs(tmp_path)
+            props_a = {
+                "ip": "::1",
+                "base_port": "19700",
+                "peer_ips": "NodeA:2602:fcfb:000d:1::2,NodeB:[::1]",
+            }
+            props_b = {
+                "ip": "[::1]",
+                "base_port": "19700",
+                "window": "0.5",
+                "peer_ips": "NodeA=::1,NodeB=::1",
+            }
+
+            light_a = DummyLightSrc(props_a, path_a, "localhost", 1883)
+            sig_b = DummySignalMeasurement(props_b, path_b, "localhost", 1883)
+            try:
+                vlink_out = light_a.get_outbound_vlink("ch_out_1", dst_cid="NodeB")
+                assert vlink_out is not None
+                assert vlink_out.peer_ip == "::1"
+
+                probe_id = str(uuid.uuid4())
+                rc = await light_a.generate(
+                    "H", channel_id="ch_out_1", dst_cid="NodeB", probe_id=probe_id
+                )
+                assert rc == 0
+
+                result = await sig_b.measure(
+                    src_cid="NodeA",
+                    dst_cid="NodeB",
+                    channel_id="ch_out_1",
+                    probe_id=probe_id,
+                )
+                assert result["detected"] is True
+                assert result["counts"] == 1
+                assert result["probe_id"] == probe_id
+                assert result["channel_id"] == "ch_in_1"
+            finally:
+                await sig_b.cleanUp()
+
+        asyncio.run(_run())
+
 
 class TestEndToEndLinkProbeProcess:
     """Verify LinkAdjacencyManager and LinkInterpreter use LightSrc and SignalMeasurement."""

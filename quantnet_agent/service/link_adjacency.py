@@ -225,7 +225,7 @@ class LinkAdjacencyManager:
             log.warning("Hello to %s failed: %s", key, e)
 
     async def _probe_if_ready(self) -> None:
-        """After each hello loop tick, check if any link is CONTROL_UP and probe it.
+        """After each hello loop tick, probe any outbound quantum link in CONTROL_UP or QUANTUM_UP.
 
         Quantum probes are only attempted when the local agent is IN_SPEC,
         meaning all calibration tasks have passed.
@@ -243,7 +243,7 @@ class LinkAdjacencyManager:
         for key, entry in self._table.all().items():
             if entry.direction == "in":
                 continue  # Inbound channels are passive
-            if entry.state != LINK_CONTROL_UP:
+            if entry.state not in (LINK_CONTROL_UP, LINK_QUANTUM_UP):
                 continue
             # Classical links stay at CONTROL_UP; only quantum links attempt probe
             if not entry.is_quantum:
@@ -253,6 +253,9 @@ class LinkAdjacencyManager:
                 ok = await self._check_switch(entry.switch_cid, entry.channel_id, entry.neighbor_channel_id)
                 if not ok:
                     log.info("Switch port check failed for %s, staying CONTROL_UP", key)
+                    if entry.state == LINK_QUANTUM_UP:
+                        self._table.record_transition(key, LINK_CONTROL_UP)
+                        self._publish_state_update(key, entry, LINK_CONTROL_UP)
                     continue
             await self._send_probe(key, entry)
 
@@ -311,6 +314,9 @@ class LinkAdjacencyManager:
                 )
                 if rc != 0:
                     log.warning("LightSrc failed to emit probe for %s", key)
+                    if entry.state == LINK_QUANTUM_UP:
+                        self._table.record_transition(key, LINK_CONTROL_UP)
+                        self._publish_state_update(key, entry, LINK_CONTROL_UP)
                     info = {
                         "direction": "out",
                         "key": key,
@@ -336,8 +342,11 @@ class LinkAdjacencyManager:
             rtt_ms = round((time.monotonic() - t0) * 1000.0, 2)
             resp = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
             if resp and resp.get("status") == "ok":
-                log.info("Probe passed for %s → QUANTUM_UP", key)
-                self._table.record_transition(key, LINK_QUANTUM_UP)
+                if entry.state != LINK_QUANTUM_UP:
+                    log.info("Probe passed for %s → QUANTUM_UP", key)
+                    self._table.record_transition(key, LINK_QUANTUM_UP)
+                else:
+                    log.debug("Periodic probe passed for %s (QUANTUM_UP)", key)
                 self._publish_state_update(key, entry, LINK_QUANTUM_UP)
                 info = {
                     "direction": "out",
@@ -352,6 +361,10 @@ class LinkAdjacencyManager:
                 return info
 
             remote_status = resp.get("status", "error") if isinstance(resp, dict) else "error"
+            if entry.state == LINK_QUANTUM_UP:
+                log.warning("Probe failed for %s → demoting to CONTROL_UP", key)
+                self._table.record_transition(key, LINK_CONTROL_UP)
+                self._publish_state_update(key, entry, LINK_CONTROL_UP)
             info = {
                 "direction": "out",
                 "key": key,
@@ -366,6 +379,9 @@ class LinkAdjacencyManager:
             return info
         except Exception as e:
             log.warning("Probe to %s failed: %s", key, e)
+            if entry.state == LINK_QUANTUM_UP:
+                self._table.record_transition(key, LINK_CONTROL_UP)
+                self._publish_state_update(key, entry, LINK_CONTROL_UP)
             info = {
                 "direction": "out",
                 "key": key,

@@ -479,13 +479,17 @@ class AgentREPL:
             print(f"  Link State:          {entry.state if entry.direction == 'out' else '—'}")
             if vlink:
                 if entry.direction == "out":
-                    endpoint = f"{vlink.get('peer_ip')}:{vlink.get('port')}"
+                    pip = str(vlink.get("peer_ip", ""))
+                    pip_fmt = f"[{pip}]" if ":" in pip else pip
+                    endpoint = f"{pip_fmt}:{vlink.get('port')}"
                     wl = vlink.get("wavelength")
                     pw = vlink.get("power")
                     print(f"  Virtual Link (TX):   {vlink.get('vlink_id')} → UDP {endpoint}")
                     print(f"  Optical Config:      wavelength={wl} nm, power={pw} dBm")
                 else:
-                    endpoint = f"{vlink.get('listen_ip')}:{vlink.get('port')}"
+                    lip = str(vlink.get("listen_ip", ""))
+                    lip_fmt = f"[{lip}]" if ":" in lip else lip
+                    endpoint = f"{lip_fmt}:{vlink.get('port')}"
                     print(f"  Virtual Link (RX):   {vlink.get('vlink_id')} ← UDP {endpoint}")
             else:
                 print("  Virtual Link:        none configured")
@@ -562,7 +566,12 @@ class AgentREPL:
                 state = entry.state
                 tx_rx = f"TX:{entry.probe_tx_count}"
                 age = self._age(entry.last_probe_sent)
-                vlink_str = f"{vlink.get('vlink_id')}→{vlink.get('peer_ip')}:{vlink.get('port')}" if vlink else "—"
+                if vlink:
+                    pip = str(vlink.get("peer_ip", ""))
+                    pip_fmt = f"[{pip}]" if ":" in pip else pip
+                    vlink_str = f"{vlink.get('vlink_id')}→{pip_fmt}:{vlink.get('port')}"
+                else:
+                    vlink_str = "—"
                 if entry.last_probe_info and entry.last_probe_info.get("rtt_ms") is not None:
                     vlink_str += f" ({entry.last_probe_info['rtt_ms']}ms)"
             else:

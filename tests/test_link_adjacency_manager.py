@@ -448,3 +448,50 @@ def test_hold_timer_uses_last_neighbor_hello_for_outbound():
     # Hold timer should use last_neighbor_hello: 60s > 30s → DOWN
     mgr._check_hold_timers()
     assert table.get(KEY).state == LINK_DOWN
+
+
+def test_periodic_probe_continues_when_quantum_up_and_demotes_on_failure():
+    """_probe_if_ready should continue probing links in QUANTUM_UP on every tick,
+    and demote to CONTROL_UP if a periodic probe fails."""
+    from unittest.mock import AsyncMock
+
+    mgr, table, cfg = make_manager()
+    os.unlink(cfg)
+    entry = LinkEntry(
+        state=LINK_CONTROL_UP,
+        last_hello_sent=datetime.utcnow(),
+        last_hello_received=datetime.utcnow(),
+        hold_time=30,
+        neighbor_cid=NEIGHBOR_CID,
+        channel_id=CH_ID,
+        neighbor_channel_id=NEIGHBOR_CH_ID,
+        switch_in_path=False,
+        switch_cid=None,
+        is_quantum=True,
+        direction="out",
+        history=[],
+    )
+    table.add(KEY, entry)
+
+    # Tick 1 & Tick 2: probe succeeds -> transitions to QUANTUM_UP on tick 1, stays QUANTUM_UP on tick 2
+    mgr._client.call = AsyncMock(return_value={"status": "ok"})
+    asyncio.run(mgr._probe_if_ready())
+    assert table.get(KEY).state == LINK_QUANTUM_UP
+    assert table.get(KEY).probe_tx_count == 1
+    assert table.get(KEY).probe_ok_count == 1
+    assert len(table.get(KEY).history) == 1
+
+    asyncio.run(mgr._probe_if_ready())
+    assert table.get(KEY).state == LINK_QUANTUM_UP
+    assert table.get(KEY).probe_tx_count == 2
+    assert table.get(KEY).probe_ok_count == 2
+    # Should not append duplicate QUANTUM_UP state transitions on every periodic probe
+    assert len(table.get(KEY).history) == 1
+
+    # Tick 3: periodic probe fails -> demotes from QUANTUM_UP to CONTROL_UP
+    mgr._client.call = AsyncMock(return_value={"status": "error"})
+    asyncio.run(mgr._probe_if_ready())
+    assert table.get(KEY).state == LINK_CONTROL_UP
+    assert table.get(KEY).probe_tx_count == 3
+    assert table.get(KEY).probe_fail_count == 1
+    assert len(table.get(KEY).history) == 2
