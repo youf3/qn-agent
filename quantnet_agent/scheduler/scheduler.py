@@ -156,9 +156,9 @@ class AgentScheduler:
         for job_id in allocation.job_ids:
             try:
                 self._scheduler.remove_job(job_id)
+                self._alloc_by_job_id.pop(job_id, None)
             except JobLookupError:
                 pass
-            self._alloc_by_job_id.pop(job_id, None)
         for index in allocation._slot_indices:
             if index < len(self.timeslots) and self.timeslots[index] is allocation:
                 self.timeslots[index] = None
