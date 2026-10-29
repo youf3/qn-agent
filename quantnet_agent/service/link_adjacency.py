@@ -49,8 +49,21 @@ class LinkAdjacencyManager:
         self.registered = False
         self._node_status_fn = node_status_fn
         self._hal = hal
+        if hal is not None and node_status_fn is not None:
+            hal.node_status_fn = node_status_fn
         self._client = RPCClient(f"{cid}-link", host=mqhost, port=mqport)
         self._neighbors: list[dict] = []
+
+    def _is_local_ready(self) -> bool:
+        """Return True if local node is IN_SPEC (or no status fn configured)."""
+        if self._node_status_fn is None:
+            return True
+        from quantnet_agent.hal.local_task_manager import NodeState
+        try:
+            status = self._node_status_fn()
+        except Exception:
+            return False
+        return status is NodeState.in_spec
 
     def _get_lightsource(self):
         if self._hal is None:
@@ -91,9 +104,6 @@ class LinkAdjacencyManager:
         for ch in data.get("channels", []):
             raw_channels.append(ch)
 
-        # Channel types that support quantum transmission
-        QUANTUM_TYPES = {"quantum", "heraldedconnection", "quantumconnection"}
-
         neighbors = []
         for ch in raw_channels:
             n = ch.get("neighbor", {})
@@ -107,12 +117,13 @@ class LinkAdjacencyManager:
                 "neighbor_channel_id": n.get("channelRef", ""),
                 "switch_in_path": False,
                 "switch_cid": None,
-                "is_quantum": ch_type in QUANTUM_TYPES,
+                "is_quantum": ch_type == "quantum",
                 "direction": ch.get("direction", "out"),
             })
         return neighbors
 
     def _init_table(self) -> None:
+        default_neighbor_ready = self._node_status_fn is None
         for nb in self._neighbors:
             key = link_key(nb["neighbor_cid"], nb["channel_id"])
             if self._table.get(key) is None:
@@ -131,6 +142,7 @@ class LinkAdjacencyManager:
                         is_quantum=nb["is_quantum"],
                         direction=nb["direction"],
                         history=[],
+                        neighbor_ready=default_neighbor_ready,
                     ),
                 )
 
@@ -155,26 +167,70 @@ class LinkAdjacencyManager:
                     key, elapsed, entry.hold_time,
                 )
                 self._table.record_transition(key, LINK_DOWN)
-                self._table.update(key, init_since=None)
+                self._table.update(
+                    key,
+                    init_since=None,
+                    neighbor_ready=(self._node_status_fn is None),
+                )
                 self._publish_state_update(key, entry, LINK_DOWN)
 
-    def _publish_state_update(self, key: str, entry: LinkEntry, state: str) -> None:
+    def _publish_state_update(
+        self,
+        key: str,
+        entry: LinkEntry,
+        state: str,
+        force: bool = False,
+        state_changed: bool | None = None,
+    ) -> None:
         # Suppress duplicate state updates (e.g., repeated DOWN from INIT timeout cycles)
-        if state == entry.last_published_state:
+        if not force and state == entry.last_published_state:
             return
+        if state != entry.last_published_state:
+            state_changed = True
+        elif state_changed is None:
+            state_changed = False
         # Fire-and-forget publish to monitor topic using MonitorEvent format
         try:
             from quantnet_mq.schema.models import monitor
+            now_iso = datetime.utcnow().isoformat()
+            probe_info = dict(entry.last_probe_info) if entry.last_probe_info else {}
+            rx_count = probe_info.get("rx_count", entry.probe_rx_count or entry.probe_ok_count)
+            probe_history = [
+                {
+                    "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                    "src_cid": self._cid,
+                    "dst_cid": entry.neighbor_cid,
+                    "channel_id": entry.channel_id,
+                    **(info if isinstance(info, dict) else {}),
+                }
+                for ts, info in (entry.probe_history or [])[-15:]
+            ]
+            value = {
+                "src_cid": self._cid,
+                "dst_cid": entry.neighbor_cid,
+                "channel_id": entry.channel_id,
+                "neighbor_channel_id": entry.neighbor_channel_id,
+                "direction": entry.direction,
+                "is_quantum": entry.is_quantum,
+                "state": state,
+                "state_changed": state_changed,
+                "timestamp": now_iso,
+                "last_probe_sent": entry.last_probe_sent.isoformat() if entry.last_probe_sent else None,
+                "last_probe_received": entry.last_probe_received.isoformat() if entry.last_probe_received else None,
+                "last_probe_status": entry.last_probe_status,
+                "last_probe_id": entry.last_probe_id,
+                "probe_tx_count": entry.probe_tx_count,
+                "probe_rx_count": rx_count,
+                "probe_ok_count": entry.probe_ok_count,
+                "probe_fail_count": entry.probe_fail_count,
+                "last_probe_info": probe_info,
+                "probe_history": probe_history,
+            }
             event = monitor.MonitorEvent(
                 rid=self._cid,
                 ts=datetime.utcnow().timestamp(),
                 eventType="linkStateUpdate",
-                value={
-                    "src_cid": self._cid,
-                    "dst_cid": entry.neighbor_cid,
-                    "channel_id": entry.channel_id,
-                    "state": state,
-                },
+                value=value,
             )
             mqtt = self._client._mqttclient
             if mqtt:
@@ -212,34 +268,95 @@ class LinkAdjacencyManager:
                 "hello_interval": self.hello_interval,
                 "hold_time": self.hold_time,
                 "timestamp": datetime.utcnow().isoformat(),
+                "ready": self._is_local_ready(),
             }
+            t0 = time.monotonic()
             resp = await self._client.call(
                 "link.hello", payload, topic=f"{LINK_TOPIC}/{entry.neighbor_cid}"
             )
+            rtt_ms = round((time.monotonic() - t0) * 1000.0, 2)
             resp = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
-            self._table.update(key, last_hello_sent=datetime.utcnow())
+            now = datetime.utcnow()
+            self._table.update(key, last_hello_sent=now)
             if entry.state == LINK_DOWN:
                 self._table.record_transition(key, LINK_INIT)
-                self._table.update(key, init_since=datetime.utcnow())
+                self._table.update(key, init_since=now)
+            if isinstance(resp, dict) and resp.get("status") == "ok":
+                remote_ready = resp.get("ready")
+                if isinstance(remote_ready, bool):
+                    for k, e in self._table.all().items():
+                        if e.neighbor_cid == entry.neighbor_cid and e.direction == "out":
+                            self._table.update(k, neighbor_ready=remote_ready)
+                has_inbound = any(
+                    e.neighbor_cid == entry.neighbor_cid and e.direction == "in"
+                    for e in self._table.all().values()
+                )
+                if not has_inbound:
+                    self._table.update(key, last_neighbor_hello=now)
+                    if entry.state == LINK_INIT:
+                        log.info(
+                            "Unidirectional hello ACK confirmed %s → CONTROL_UP",
+                            key,
+                        )
+                        self._table.record_transition(key, LINK_CONTROL_UP)
+                        self._table.update(key, init_since=None)
+                if not entry.is_quantum and entry.state == LINK_CONTROL_UP:
+                    hello_id = str(uuid.uuid4())
+                    info = {
+                        "direction": "out",
+                        "kind": "hello",
+                        "key": key,
+                        "probe_id": hello_id,
+                        "status": "ok",
+                        "rtt_ms": rtt_ms,
+                        "rx_count": (entry.probe_ok_count or 0) + 1,
+                        "state": LINK_CONTROL_UP,
+                        "vlink": (
+                            f"{self._cid}:{entry.channel_id}"
+                            f"->{entry.neighbor_cid}:{entry.neighbor_channel_id}"
+                        ),
+                    }
+                    self._table.record_probe(key, info)
+                    self._publish_state_update(
+                        key, entry, LINK_CONTROL_UP, force=True, state_changed=False
+                    )
         except Exception as e:
             log.warning("Hello to %s failed: %s", key, e)
+            if not entry.is_quantum and entry.state == LINK_CONTROL_UP:
+                hello_id = str(uuid.uuid4())
+                info = {
+                    "direction": "out",
+                    "kind": "hello",
+                    "key": key,
+                    "probe_id": hello_id,
+                    "status": "rpc_error",
+                    "reason": str(e),
+                    "rx_count": entry.probe_ok_count or 0,
+                    "state": entry.state,
+                    "vlink": (
+                        f"{self._cid}:{entry.channel_id}"
+                        f"->{entry.neighbor_cid}:{entry.neighbor_channel_id}"
+                    ),
+                }
+                self._table.record_probe(key, info)
+                self._publish_state_update(
+                    key, entry, entry.state, force=True, state_changed=False
+                )
 
     async def _probe_if_ready(self) -> None:
         """After each hello loop tick, probe any outbound quantum link in CONTROL_UP or QUANTUM_UP.
 
-        Quantum probes are only attempted when the local agent is IN_SPEC,
-        meaning all calibration tasks have passed.
+        Quantum probes are only attempted when BOTH the local agent and the
+        neighbor agent are IN_SPEC, meaning all calibration tasks have passed
+        on both endpoints.
         """
-        if self._node_status_fn is not None:
-            from quantnet_agent.hal.local_task_manager import NodeState
-            try:
-                status = self._node_status_fn()
-            except Exception:
-                log.debug("Skipping quantum probe — could not read agent status")
-                return
-            if status is not NodeState.in_spec:
-                log.debug("Skipping quantum probe — agent not IN_SPEC (current: %s)", status.value)
-                return
+        if not self._is_local_ready():
+            log.debug("Skipping quantum probe — local agent not IN_SPEC")
+            for key, entry in self._table.all().items():
+                if entry.direction == "out" and entry.is_quantum and entry.state == LINK_QUANTUM_UP:
+                    self._table.record_transition(key, LINK_CONTROL_UP)
+                    self._publish_state_update(key, entry, LINK_CONTROL_UP)
+            return
         for key, entry in self._table.all().items():
             if entry.direction == "in":
                 continue  # Inbound channels are passive
@@ -248,6 +365,16 @@ class LinkAdjacencyManager:
             # Classical links stay at CONTROL_UP; only quantum links attempt probe
             if not entry.is_quantum:
                 log.debug("Skipping quantum probe for classical link %s", key)
+                continue
+            if not entry.neighbor_ready:
+                log.debug(
+                    "Skipping quantum probe for %s — neighbor %s not ready (not IN_SPEC)",
+                    key,
+                    entry.neighbor_cid,
+                )
+                if entry.state == LINK_QUANTUM_UP:
+                    self._table.record_transition(key, LINK_CONTROL_UP)
+                    self._publish_state_update(key, entry, LINK_CONTROL_UP)
                 continue
             if entry.switch_in_path and entry.switch_cid:
                 ok = await self._check_switch(entry.switch_cid, entry.channel_id, entry.neighbor_channel_id)
@@ -291,6 +418,26 @@ class LinkAdjacencyManager:
                 "key": key,
                 "direction": entry.direction,
             }
+        if not self._is_local_ready():
+            log.debug("Skipping quantum probe on %s — local node not ready (not IN_SPEC)", key)
+            return {
+                "status": "skipped",
+                "reason": "local_node_not_ready",
+                "key": key,
+                "direction": entry.direction,
+            }
+        if not entry.neighbor_ready:
+            log.debug(
+                "Skipping quantum probe on %s — neighbor %s not ready (not IN_SPEC)",
+                key,
+                entry.neighbor_cid,
+            )
+            return {
+                "status": "skipped",
+                "reason": "neighbor_node_not_ready",
+                "key": key,
+                "direction": entry.direction,
+            }
         vlink_info = {}
         probe_id = str(uuid.uuid4())
         try:
@@ -314,9 +461,9 @@ class LinkAdjacencyManager:
                 )
                 if rc != 0:
                     log.warning("LightSrc failed to emit probe for %s", key)
-                    if entry.state == LINK_QUANTUM_UP:
+                    state_changed = entry.state == LINK_QUANTUM_UP
+                    if state_changed:
                         self._table.record_transition(key, LINK_CONTROL_UP)
-                        self._publish_state_update(key, entry, LINK_CONTROL_UP)
                     info = {
                         "direction": "out",
                         "key": key,
@@ -327,6 +474,9 @@ class LinkAdjacencyManager:
                         **vlink_info,
                     }
                     self._table.record_probe(key, info)
+                    self._publish_state_update(
+                        key, entry, entry.state, force=True, state_changed=state_changed
+                    )
                     return info
 
             payload = {
@@ -335,53 +485,79 @@ class LinkAdjacencyManager:
                 "channel_id": entry.channel_id,
                 "probe_id": probe_id,
             }
-            t0 = time.monotonic()
             resp = await self._client.call(
                 "link.probe", payload, topic=f"{LINK_TOPIC}/{entry.neighbor_cid}"
             )
-            rtt_ms = round((time.monotonic() - t0) * 1000.0, 2)
             resp = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
+            remote_data = (
+                resp.get("data")
+                if isinstance(resp, dict) and isinstance(resp.get("data"), dict)
+                else {}
+            )
             if resp and resp.get("status") == "ok":
-                if entry.state != LINK_QUANTUM_UP:
+                state_changed = entry.state != LINK_QUANTUM_UP
+                if state_changed:
                     log.info("Probe passed for %s → QUANTUM_UP", key)
                     self._table.record_transition(key, LINK_QUANTUM_UP)
                 else:
                     log.debug("Periodic probe passed for %s (QUANTUM_UP)", key)
-                self._publish_state_update(key, entry, LINK_QUANTUM_UP)
                 info = {
                     "direction": "out",
                     "key": key,
                     "probe_id": probe_id,
                     "status": "ok",
-                    "rtt_ms": rtt_ms,
                     "state": LINK_QUANTUM_UP,
                     **vlink_info,
                 }
+                for rk in ("detected", "counts", "tof", "rx_count"):
+                    if rk in remote_data and remote_data[rk] is not None:
+                        info[rk] = remote_data[rk]
+                if not info.get("vlink") and remote_data.get("vlink"):
+                    info["vlink"] = remote_data["vlink"]
                 self._table.record_probe(key, info)
+                self._publish_state_update(
+                    key, entry, LINK_QUANTUM_UP, force=True, state_changed=state_changed
+                )
                 return info
 
             remote_status = resp.get("status", "error") if isinstance(resp, dict) else "error"
-            if entry.state == LINK_QUANTUM_UP:
+            if remote_status == "not_ready":
+                log.info("Neighbor %s not ready for quantum probe on %s — waiting", entry.neighbor_cid, key)
+                self._table.update(key, neighbor_ready=False)
+                if entry.state == LINK_QUANTUM_UP:
+                    self._table.record_transition(key, LINK_CONTROL_UP)
+                    self._publish_state_update(key, entry, LINK_CONTROL_UP)
+                return {
+                    "status": "skipped",
+                    "reason": remote_data.get("reason", "neighbor_not_ready"),
+                    "key": key,
+                    "direction": entry.direction,
+                }
+            state_changed = entry.state == LINK_QUANTUM_UP
+            if state_changed:
                 log.warning("Probe failed for %s → demoting to CONTROL_UP", key)
                 self._table.record_transition(key, LINK_CONTROL_UP)
-                self._publish_state_update(key, entry, LINK_CONTROL_UP)
             info = {
                 "direction": "out",
                 "key": key,
                 "probe_id": probe_id,
                 "status": remote_status,
-                "reason": "remote_rejected",
-                "rtt_ms": rtt_ms,
+                "reason": remote_data.get("reason", "remote_rejected"),
                 "state": entry.state,
                 **vlink_info,
             }
+            if "rx_count" in remote_data and remote_data["rx_count"] is not None:
+                info["rx_count"] = remote_data["rx_count"]
             self._table.record_probe(key, info)
+            self._publish_state_update(
+                key, entry, entry.state, force=True, state_changed=state_changed
+            )
             return info
         except Exception as e:
             log.warning("Probe to %s failed: %s", key, e)
-            if entry.state == LINK_QUANTUM_UP:
+            state_changed = entry.state == LINK_QUANTUM_UP
+            if state_changed:
                 self._table.record_transition(key, LINK_CONTROL_UP)
-                self._publish_state_update(key, entry, LINK_CONTROL_UP)
             info = {
                 "direction": "out",
                 "key": key,
@@ -392,12 +568,16 @@ class LinkAdjacencyManager:
                 **vlink_info,
             }
             self._table.record_probe(key, info)
+            self._publish_state_update(
+                key, entry, entry.state, force=True, state_changed=state_changed
+            )
             return info
 
     async def _hello_loop(self) -> None:
         while self.is_started:
             keys = list(self._table.all().keys())
-            await asyncio.gather(*(self._send_hello(k) for k in keys))
+            for k in keys:
+                await self._send_hello(k)
             self._check_hold_timers()
             await self._probe_if_ready()
             self._publish_pending_updates()

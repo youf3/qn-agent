@@ -271,3 +271,46 @@ def test_handle_switch_port_check_returns_ok():
     msg.payload.dst_channel = "4"
     result = asyncio.run(interp.handle_switch_port_check(msg))
     assert result.status in ("ok", "port_down", "not_routed")
+
+
+def test_handle_hello_propagates_neighbor_ready_and_returns_local_ready():
+    from quantnet_agent.hal.local_task_manager import NodeState
+
+    hal = make_hal("QNode")
+    hal._config.cid = MY_CID
+    hal.node_status_fn = lambda: NodeState.out_of_spec
+    outbound_key = link_key(SRC, "1")
+    outbound_entry = make_entry(
+        LINK_CONTROL_UP, neighbor_cid=SRC, channel_id="1", neighbor_channel_id="4", direction="out"
+    )
+    outbound_entry.neighbor_ready = False
+    hal.link_state_table.add(outbound_key, outbound_entry)
+    inbound_key = link_key(SRC, "2")
+    hal.link_state_table.add(
+        inbound_key,
+        make_entry(LINK_DOWN, neighbor_cid=SRC, channel_id="2", neighbor_channel_id="5", direction="in"),
+    )
+    interp = LinkInterpreter(hal)
+
+    msg = MagicMock()
+    msg.payload.src_cid = SRC
+    msg.payload.neighbor_channel_id = "5"
+    msg.payload.seen_neighbors = [MY_CID]
+    msg.payload.ready = True
+
+    resp = asyncio.run(interp.handle_hello(msg))
+    assert hal.link_state_table.get(outbound_key).neighbor_ready is True
+    assert bool(resp.ready) is False
+
+
+def test_handle_probe_defers_when_local_node_not_ready():
+    from quantnet_agent.hal.local_task_manager import NodeState
+
+    hal = make_hal("QNode")
+    hal.node_status_fn = lambda: NodeState.out_of_spec
+    interp = LinkInterpreter(hal)
+    msg = MagicMock()
+    msg.payload.src_cid = SRC
+    msg.payload.channel_id = "1"
+    result = asyncio.run(interp.handle_probe(msg))
+    assert str(result.status) == "not_ready"

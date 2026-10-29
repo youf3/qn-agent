@@ -11,6 +11,33 @@ class LinkInterpreter(CMDInterpreter):
     def __init__(self, hal):
         super().__init__(hal)
 
+    @staticmethod
+    def _extract_bool(val) -> bool | None:
+        if isinstance(val, bool):
+            return val
+        inner = getattr(val, "_value", None)
+        if isinstance(inner, bool):
+            return inner
+        return None
+
+    def _is_local_ready(self) -> bool:
+        """Return True if local node is IN_SPEC (or no status fn configured)."""
+        from quantnet_agent.hal.local_task_manager import NodeState
+
+        fn = getattr(self.hal, "node_status_fn", None)
+        if not callable(fn):
+            link_mgr = getattr(self.hal, "link_mgr", None)
+            fn = getattr(link_mgr, "_node_status_fn", None) if link_mgr is not None else None
+        if not callable(fn):
+            return True
+        try:
+            status = fn()
+        except Exception:
+            return False
+        if not isinstance(status, NodeState):
+            return True
+        return status is NodeState.in_spec
+
     def get_commands(self) -> dict:
         cmds = {
             "link.control": [
@@ -212,12 +239,20 @@ class LinkInterpreter(CMDInterpreter):
 
         now = datetime.utcnow()
         table.update(key, last_hello_received=now)
+        rx_entry = table.get(key) if hasattr(table, "get") else None
+        if rx_entry is not None and not getattr(rx_entry, "is_quantum", True):
+            rx_entry.last_probe_received = now
+            rx_entry.probe_rx_count = getattr(rx_entry, "probe_rx_count", 0) + 1
 
-        # Propagate liveness to all outbound entries for this neighbor
+        # Propagate liveness (and neighbor readiness) to all outbound entries for this neighbor
         # (so hold timers on outbound can detect if neighbor stopped sending)
+        remote_ready = self._extract_bool(getattr(msg.payload, "ready", None))
         for k, e in table.all().items():
             if e.neighbor_cid == neighbor_cid and e.direction == "out":
-                table.update(k, last_neighbor_hello=now)
+                updates = {"last_neighbor_hello": now}
+                if remote_ready is not None:
+                    updates["neighbor_ready"] = remote_ready
+                table.update(k, **updates)
 
         # Check for bilateral confirmation
         my_cid = getattr(self.hal._config, "cid", None)
@@ -235,7 +270,7 @@ class LinkInterpreter(CMDInterpreter):
                         table.record_transition(k, LINK_CONTROL_UP)
                         table.update(k, init_since=None)
 
-        return models.link_adjacency.linkHelloResponse(status="ok")
+        return models.link_adjacency.linkHelloResponse(status="ok", ready=self._is_local_ready())
 
     async def handle_probe(self, msg):
         from quantnet_mq.schema import models
@@ -272,8 +307,30 @@ class LinkInterpreter(CMDInterpreter):
                     )
                     return models.link_adjacency.linkProbeResponse(status="error")
 
+        if not self._is_local_ready():
+            in_entry = (
+                table.get(in_key)
+                if (table is not None and in_key is not None and hasattr(table, "get"))
+                else None
+            )
+            log.info(
+                "LinkInterpreter: deferring probe %s from %s ch %s — local node not IN_SPEC",
+                probe_id,
+                src_cid,
+                channel_id,
+            )
+            return models.link_adjacency.linkProbeResponse(
+                status="not_ready",
+                data={
+                    "detected": False,
+                    "reason": "neighbor_not_ready",
+                    "rx_count": getattr(in_entry, "probe_rx_count", 0) if in_entry else 0,
+                },
+            )
+
         devs = getattr(self.hal, "devs", None)
         sig_dev = devs.get("signalmeasurement") if isinstance(devs, dict) else None
+        probe_data = {}
         if isinstance(sig_dev, SignalMeasurement):
             res = await sig_dev.measure(
                 src_cid=src_cid,
@@ -296,6 +353,7 @@ class LinkInterpreter(CMDInterpreter):
                             "reason": str(reason or "no_detection"),
                         },
                     )
+                in_entry = table.get(in_key) if (in_key is not None and hasattr(table, "get")) else None
                 log.warning(
                     "LinkInterpreter: time-tagger did not detect quantum probe %s from %s ch %s (%s)",
                     probe_id,
@@ -303,7 +361,14 @@ class LinkInterpreter(CMDInterpreter):
                     channel_id,
                     reason,
                 )
-                return models.link_adjacency.linkProbeResponse(status="error")
+                return models.link_adjacency.linkProbeResponse(
+                    status="error",
+                    data={
+                        "detected": False,
+                        "reason": str(reason or "no_detection"),
+                        "rx_count": getattr(in_entry, "probe_rx_count", 0) if in_entry else 0,
+                    },
+                )
 
             if in_key is not None and hasattr(table, "record_probe"):
                 table.record_probe(
@@ -321,6 +386,14 @@ class LinkInterpreter(CMDInterpreter):
                         "vlink": res.get("vlink", ""),
                     },
                 )
+            in_entry = table.get(in_key) if (in_key is not None and hasattr(table, "get")) else None
+            probe_data = {
+                "detected": True,
+                "counts": res.get("counts", 1),
+                "tof": res.get("tof", 0.0),
+                "vlink": res.get("vlink", ""),
+                "rx_count": getattr(in_entry, "probe_rx_count", 1) if in_entry else 1,
+            }
         elif in_key is not None and hasattr(table, "record_probe"):
             table.record_probe(
                 in_key,
@@ -333,8 +406,14 @@ class LinkInterpreter(CMDInterpreter):
                     "counts": 1,
                 },
             )
+            in_entry = table.get(in_key) if hasattr(table, "get") else None
+            probe_data = {
+                "detected": True,
+                "counts": 1,
+                "rx_count": getattr(in_entry, "probe_rx_count", 1) if in_entry else 1,
+            }
 
-        return models.link_adjacency.linkProbeResponse(status="ok")
+        return models.link_adjacency.linkProbeResponse(status="ok", data=probe_data)
 
     async def handle_switch_port_check(self, msg):
         from quantnet_mq.schema import models

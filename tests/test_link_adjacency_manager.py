@@ -495,3 +495,189 @@ def test_periodic_probe_continues_when_quantum_up_and_demotes_on_failure():
     assert table.get(KEY).probe_tx_count == 3
     assert table.get(KEY).probe_fail_count == 1
     assert len(table.get(KEY).history) == 2
+
+
+def test_unidirectional_hello_ack_promotes_to_control_up():
+    """When a node has only an outbound channel to a neighbor (no inbound channel
+    from that neighbor), an 'ok' RPC response to link.hello promotes the link
+    to CONTROL_UP and refreshes last_neighbor_hello so it does not oscillate INIT <-> DOWN."""
+    from unittest.mock import AsyncMock
+
+    channels = [
+        {
+            "ID": "1",
+            "type": "classic_clk",
+            "direction": "out",
+            "neighbor": {"systemRef": "QPU-2", "channelRef": "1"},
+        }
+    ]
+    mgr, table, cfg = make_manager(channels=channels)
+    mgr._neighbors = mgr._load_neighbors()
+    mgr._init_table()
+    os.unlink(cfg)
+
+    key = link_key("QPU-2", "1")
+    assert table.get(key).state == LINK_DOWN
+    mgr._client.call = AsyncMock(return_value={"status": "ok"})
+
+    asyncio.run(mgr._send_hello(key))
+    assert table.get(key).state == LINK_CONTROL_UP
+    assert table.get(key).last_neighbor_hello is not None
+    assert table.get(key).init_since is None
+
+
+def test_bidirectional_hello_waits_for_inbound_hello():
+    """When a node also has an inbound channel from the neighbor, _send_hello
+    transitions DOWN -> INIT and waits for the neighbor's inbound hello."""
+    from unittest.mock import AsyncMock
+
+    channels = [
+        {
+            "ID": "2",
+            "type": "quantum",
+            "direction": "out",
+            "neighbor": {"systemRef": NEIGHBOR_CID, "channelRef": "1"},
+        },
+        {
+            "ID": "3",
+            "type": "classic_comm",
+            "direction": "in",
+            "neighbor": {"systemRef": NEIGHBOR_CID, "channelRef": "3"},
+        },
+    ]
+    mgr, table, cfg = make_manager(channels=channels)
+    mgr._neighbors = mgr._load_neighbors()
+    mgr._init_table()
+    os.unlink(cfg)
+
+    key_out = link_key(NEIGHBOR_CID, "2")
+    mgr._client.call = AsyncMock(return_value={"status": "ok"})
+
+    asyncio.run(mgr._send_hello(key_out))
+    assert table.get(key_out).state == LINK_INIT
+    assert table.get(key_out).init_since is not None
+
+
+def test_classical_hello_periodic_telemetry_preserves_state_changed():
+    """Classical links in CONTROL_UP record periodic hello telemetry and publish
+    state_changed=True only on actual state transitions, and state_changed=False
+    on steady-state periodic heartbeats."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    channels = [
+        {
+            "ID": "3",
+            "type": "classic_comm",
+            "direction": "out",
+            "neighbor": {"systemRef": "QPU-1", "channelRef": "3"},
+        },
+        {
+            "ID": "1",
+            "type": "quantum",
+            "direction": "in",
+            "neighbor": {"systemRef": "QPU-1", "channelRef": "2"},
+        },
+    ]
+    mgr, table, cfg = make_manager(channels=channels)
+    mgr._neighbors = mgr._load_neighbors()
+    mgr._init_table()
+    os.unlink(cfg)
+
+    key_out = link_key("QPU-1", "3")
+    mgr._client.call = AsyncMock(return_value={"status": "ok"})
+    mgr._client._mqttclient = MagicMock()
+
+    published_events = []
+
+    def capture_publish(topic, payload, qos=1):
+        published_events.append(json.loads(payload))
+
+    mgr._client._mqttclient.publish.side_effect = capture_publish
+
+    # Tick 1: DOWN -> INIT, published by _publish_pending_updates with state_changed=True
+    asyncio.run(mgr._send_hello(key_out))
+    mgr._publish_pending_updates()
+    assert table.get(key_out).state == LINK_INIT
+    assert len(published_events) == 1
+    assert published_events[-1]["value"]["state"] == LINK_INIT
+    assert published_events[-1]["value"]["state_changed"] is True
+
+    # Simulate LinkInterpreter.handle_hello promoting INIT -> CONTROL_UP in memory
+    table.record_transition(key_out, LINK_CONTROL_UP)
+    table.update(key_out, init_since=None)
+
+    # Tick 2: _send_hello runs while state==CONTROL_UP and last_published_state==INIT.
+    # Must publish state_changed=True so controller's dynamic topology/router refreshes!
+    asyncio.run(mgr._send_hello(key_out))
+    mgr._publish_pending_updates()
+    assert len(published_events) == 2
+    assert published_events[-1]["value"]["state"] == LINK_CONTROL_UP
+    assert published_events[-1]["value"]["state_changed"] is True
+    assert published_events[-1]["value"]["probe_tx_count"] == 1
+    assert published_events[-1]["value"]["probe_ok_count"] == 1
+    assert published_events[-1]["value"]["last_probe_info"]["kind"] == "hello"
+
+    # Tick 3: steady-state periodic hello on CONTROL_UP must publish state_changed=False
+    asyncio.run(mgr._send_hello(key_out))
+    mgr._publish_pending_updates()
+    assert len(published_events) == 3
+    assert published_events[-1]["value"]["state"] == LINK_CONTROL_UP
+    assert published_events[-1]["value"]["state_changed"] is False
+    assert published_events[-1]["value"]["probe_tx_count"] == 2
+    assert published_events[-1]["value"]["probe_ok_count"] == 2
+
+
+def test_quantum_probe_waits_until_both_nodes_are_ready():
+    """Quantum probe must not fire until BOTH the local node and the neighbor node
+    are IN_SPEC (ready)."""
+    from unittest.mock import AsyncMock
+    from quantnet_agent.hal.local_task_manager import NodeState
+
+    local_state = {"status": NodeState.out_of_spec}
+    table = LinkStateTable()
+    cfg_path = make_node_config()
+    mgr = LinkAdjacencyManager(
+        cid=MY_CID,
+        node_config=cfg_path,
+        mqhost="localhost",
+        mqport=1883,
+        link_state_table=table,
+        node_status_fn=lambda: local_state["status"],
+    )
+    mgr._neighbors = mgr._load_neighbors()
+    mgr._init_table()
+    os.unlink(cfg_path)
+
+    # Bring link to CONTROL_UP while neighbor_ready is still False
+    table.record_transition(KEY, LINK_CONTROL_UP)
+    assert table.get(KEY).neighbor_ready is False
+
+    mgr._client.call = AsyncMock(return_value={"status": "ok"})
+
+    # 1. Local OUT_OF_SPEC, neighbor not ready -> no probe
+    asyncio.run(mgr._probe_if_ready())
+    mgr._client.call.assert_not_called()
+    assert table.get(KEY).state == LINK_CONTROL_UP
+
+    # 2. Local becomes IN_SPEC, but neighbor is still not ready -> no probe
+    local_state["status"] = NodeState.in_spec
+    asyncio.run(mgr._probe_if_ready())
+    mgr._client.call.assert_not_called()
+    assert table.get(KEY).state == LINK_CONTROL_UP
+
+    # 3. _send_hello receives ready=False from neighbor -> still no probe
+    mgr._client.call = AsyncMock(return_value={"status": "ok", "ready": False})
+    asyncio.run(mgr._send_hello(KEY))
+    assert table.get(KEY).neighbor_ready is False
+    mgr._client.call.reset_mock()
+    asyncio.run(mgr._probe_if_ready())
+    mgr._client.call.assert_not_called()
+
+    # 4. _send_hello receives ready=True from neighbor -> both ready, probe runs and promotes to QUANTUM_UP
+    mgr._client.call = AsyncMock(return_value={"status": "ok", "ready": True})
+    asyncio.run(mgr._send_hello(KEY))
+    assert table.get(KEY).neighbor_ready is True
+    mgr._client.call = AsyncMock(return_value={"status": "ok"})
+    asyncio.run(mgr._probe_if_ready())
+    mgr._client.call.assert_awaited_once()
+    assert table.get(KEY).state == LINK_QUANTUM_UP

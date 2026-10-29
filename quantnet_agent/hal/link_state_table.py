@@ -29,6 +29,7 @@ class LinkEntry:
     init_since: datetime | None = field(default=None)  # when link entered INIT
     last_published_state: str | None = field(default=None)  # suppress duplicate state updates
     last_neighbor_hello: datetime | None = field(default=None)  # last hello from neighbor (any inbound channel)
+    neighbor_ready: bool = field(default=True)  # whether neighbor node is IN_SPEC (ready for quantum probes)
     last_probe_sent: datetime | None = field(default=None)
     last_probe_received: datetime | None = field(default=None)
     last_probe_status: str | None = field(default=None)
@@ -85,6 +86,8 @@ class LinkStateTable:
         if info.get("probe_id") is not None:
             entry.last_probe_id = str(info["probe_id"])
         snapshot = dict(info)
+        snapshot.setdefault("seq", entry.probe_tx_count if direction == "out" else entry.probe_rx_count)
+        snapshot.setdefault("ts", now.isoformat())
         entry.last_probe_info = snapshot
         entry.probe_history.append((now, snapshot))
         if len(entry.probe_history) > max_history:
