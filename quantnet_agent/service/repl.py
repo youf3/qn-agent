@@ -11,19 +11,36 @@ import time
 from datetime import datetime
 
 from quantnet_agent.hal.link_state_table import (
-    LINK_DOWN, LINK_INIT, LINK_CONTROL_UP, LINK_QUANTUM_UP,
+    LINK_DOWN,
+    LINK_INIT,
+    LINK_CONTROL_UP,
+    LINK_QUANTUM_UP,
 )
 
 log = logging.getLogger(__name__)
 
 COMMANDS = [
-    "show link", "show probe", "show logging", "show config", "show switch-check",
-    "connect", "disconnect", "probe",
-    "set hello-interval", "set hold-time",
-    "debug link", "no debug link",
-    "debug probe", "no debug probe",
-    "logging console", "no logging console",
-    "monitor", "monitor probe", "help", "exit", "quit",
+    "show link",
+    "show probe",
+    "show logging",
+    "show config",
+    "show switch-check",
+    "connect",
+    "disconnect",
+    "probe",
+    "set hello-interval",
+    "set hold-time",
+    "debug link",
+    "no debug link",
+    "debug probe",
+    "no debug probe",
+    "logging console",
+    "no logging console",
+    "monitor",
+    "monitor probe",
+    "help",
+    "exit",
+    "quit",
 ]
 
 
@@ -31,8 +48,18 @@ def _make_completer(table):
     """Build a context-aware completer that uses the full line buffer."""
     # Top-level commands (first word)
     top_cmds = [
-        "show", "connect", "disconnect", "probe", "set",
-        "debug", "no", "logging", "monitor", "help", "exit", "quit",
+        "show",
+        "connect",
+        "disconnect",
+        "probe",
+        "set",
+        "debug",
+        "no",
+        "logging",
+        "monitor",
+        "help",
+        "exit",
+        "quit",
     ]
     # Subcommand trees
     show_subs = ["link", "probe", "logging", "config", "switch-check"]
@@ -102,6 +129,7 @@ def _make_completer(table):
             options = []
 
         return options[state] if state < len(options) else None
+
     return completer
 
 
@@ -196,16 +224,20 @@ class AgentREPL:
         """Filter log records for the REPL handler based on console/debug flags."""
         if self._logging_console_enabled and record.levelno >= logging.INFO:
             return True
-        if self._debug and record.name.startswith((
-            "quantnet_agent.service.link_adjacency",
-            "quantnet_agent.hal.interpreter.link",
-        )):
+        if self._debug and record.name.startswith(
+            (
+                "quantnet_agent.service.link_adjacency",
+                "quantnet_agent.hal.interpreter.link",
+            )
+        ):
             return True
-        if self._debug_probe and record.name.startswith((
-            "quantnet_agent.hal.driver.dummy",
-            "quantnet_agent.service.link_adjacency",
-            "quantnet_agent.hal.interpreter.link",
-        )):
+        if self._debug_probe and record.name.startswith(
+            (
+                "quantnet_agent.hal.driver.dummy",
+                "quantnet_agent.service.link_adjacency",
+                "quantnet_agent.hal.interpreter.link",
+            )
+        ):
             return True
         return False
 
@@ -231,9 +263,7 @@ class AgentREPL:
             if isinstance(h, logging.StreamHandler) and h.stream is sys.stdout:
                 fmt = h.formatter
                 break
-        self._repl_handler = REPLLogHandler(
-            self._prompt, fmt=fmt, filter_fn=self._allow_log_record
-        )
+        self._repl_handler = REPLLogHandler(self._prompt, fmt=fmt, filter_fn=self._allow_log_record)
         self._update_repl_log_level()
         # Remove stdout handlers, add ours
         self._original_handlers = []
@@ -269,6 +299,7 @@ class AgentREPL:
             on_shutdown: optional callable invoked after the REPL exits
         """
         from quantnet_agent.common.logging import clear_buffered_logs
+
         self._loop = loop
         self._setup_readline()
         self._install_log_handler()
@@ -669,9 +700,7 @@ class AgentREPL:
         if not entry.switch_in_path or not entry.switch_cid:
             print("No switch in path for this link.")
             return
-        ok = await self._link_mgr._check_switch(
-            entry.switch_cid, entry.channel_id, entry.neighbor_channel_id
-        )
+        ok = await self._link_mgr._check_switch(entry.switch_cid, entry.channel_id, entry.neighbor_channel_id)
         print(f"Switch port check: {'OK' if ok else 'FAILED'}")
 
     def _cmd_link_debug(self, onoff: str):
@@ -713,6 +742,7 @@ class AgentREPL:
     def _cmd_show_logging(self):
         """Show current logging console status and buffered logs."""
         from quantnet_agent.common.logging import get_buffered_logs
+
         status = "enabled" if self._logging_console_enabled else "disabled"
         print(f"Logging to console is {status}.")
         logs = get_buffered_logs(50)  # Show last 50 logs
@@ -728,6 +758,7 @@ class AgentREPL:
     def _cmd_show_config(self):
         """Show agent configuration state."""
         import json
+
         cid = self._config.cid if self._config else "N/A"
 
         print(f"\nAgent Configuration ({cid}):")
@@ -752,10 +783,10 @@ class AgentREPL:
                 if qubits:
                     print(f"\nQubits ({len(qubits)} total):")
                     for qubit in qubits:
-                        qubit_id = qubit.get('ID')
-                        qubit_type = qubit.get('quantumObject', 'N/A')
-                        t1 = qubit.get('T1', {}).get('value', 'N/A')
-                        t2 = qubit.get('T2', {}).get('value', 'N/A')
+                        qubit_id = qubit.get("ID")
+                        qubit_type = qubit.get("quantumObject", "N/A")
+                        t1 = qubit.get("T1", {}).get("value", "N/A")
+                        t2 = qubit.get("T2", {}).get("value", "N/A")
                         print(f"    Qubit {qubit_id}")
                         print(f"      Type               {qubit_type}")
                         print(f"      T1 (decay)         {t1} s")
@@ -772,7 +803,7 @@ class AgentREPL:
                     print(header)
                     print("  " + "-" * 56)
                     for ch in channels:
-                        ch_id = ch.get('ID')
+                        ch_id = ch.get("ID")
                         ch_type = ch.get("type", "N/A")
                         direction = ch.get("direction", "N/A")[:3]
                         neighbor = ch.get("neighbor", {})
@@ -813,16 +844,29 @@ class AgentREPL:
         else:
             print("Usage: logging console / no logging console")
 
+    @staticmethod
+    def _safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0, w: int | None = None):
+        try:
+            clipped = text[: max(0, w - 1 - x)] if w is not None else text
+            stdscr.addstr(y, x, clipped, attr)
+        except curses.error:
+            pass
+
     def _cmd_link_monitor(self, mode: str = "link"):
         """Enter curses live dashboard mode."""
         try:
             curses.wrapper(lambda stdscr: self._monitor_dashboard(stdscr, initial_mode=mode))
         except KeyboardInterrupt:
             pass
+        except curses.error as exc:
+            print(f"Monitor error (terminal/TTY required): {exc}")
         print("Returned to prompt.")
 
     def _monitor_dashboard(self, stdscr, initial_mode: str = "link"):
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
         stdscr.nodelay(True)
         curses.start_color()
         curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
@@ -848,9 +892,7 @@ class AgentREPL:
             elif key == ord("r") and self._loop is not None and self._link_mgr is not None:
                 for lkey, lentry in self._table.all().items():
                     if lentry.direction == "out" and lentry.is_quantum:
-                        asyncio.run_coroutine_threadsafe(
-                            self._link_mgr._send_probe(lkey, lentry), self._loop
-                        )
+                        asyncio.run_coroutine_threadsafe(self._link_mgr._send_probe(lkey, lentry), self._loop)
 
             stdscr.clear()
             h, w = stdscr.getmaxyx()
@@ -860,12 +902,14 @@ class AgentREPL:
                 self._render_probe_dashboard(stdscr, h, w, now, STATE_COLOR)
             else:
                 title = f" Link Adjacency Monitor ── {self._node_name} ── {now} "
-                stdscr.addstr(0, 0, title[:w - 1], curses.A_BOLD)
-                stdscr.addstr(1, 0, "─" * (w - 1))
+                self._safe_addstr(stdscr, 0, 0, title[: w - 1], curses.A_BOLD)
+                self._safe_addstr(stdscr, 1, 0, "─" * (w - 1))
 
                 # Header row
-                stdscr.addstr(2, 0, f"{'Neighbor':<44} {'State':<14} {'Last RX':<12}", curses.A_BOLD)
-                stdscr.addstr(3, 0, "─" * (w - 1))
+                self._safe_addstr(
+                    stdscr, 2, 0, f"{'Neighbor':<44} {'State':<14} {'Last RX':<12}"[: w - 1], curses.A_BOLD
+                )
+                self._safe_addstr(stdscr, 3, 0, "─" * (w - 1))
 
                 entries = self._table.all()
                 row = 4
@@ -875,11 +919,11 @@ class AgentREPL:
                         break
                     color = curses.color_pair(STATE_COLOR.get(entry.state, 0))
                     line = f"{cid[:43]:<44} {entry.state:<14} {self._age(entry.last_hello_received):<12}"
-                    stdscr.addstr(row, 0, line[:w - 1], color)
+                    self._safe_addstr(stdscr, row, 0, line[: w - 1], color)
                     row += 1
 
-                stdscr.addstr(split, 0, "─" * (w - 1))
-                stdscr.addstr(split + 1, 0, "Recent Events", curses.A_BOLD)
+                self._safe_addstr(stdscr, split, 0, "─" * (w - 1))
+                self._safe_addstr(stdscr, split + 1, 0, "Recent Events", curses.A_BOLD)
 
                 # Collect recent history from all entries
                 events = []
@@ -888,15 +932,15 @@ class AgentREPL:
                         events.append((ts, cid, state))
                 events.sort(key=lambda x: x[0], reverse=True)
 
-                for i, (ts, cid, state) in enumerate(events[:h - split - 4]):
+                for i, (ts, cid, state) in enumerate(events[: max(0, h - split - 4)]):
                     color = curses.color_pair(STATE_COLOR.get(state, 0))
                     short = cid.split(":")[-2] if ":" in cid else cid
                     line = f"  {ts.strftime('%H:%M:%S')}  {short:<20} {state}"
-                    stdscr.addstr(split + 2 + i, 0, line[:w - 1], color)
+                    self._safe_addstr(stdscr, split + 2 + i, 0, line[: w - 1], color)
 
-                stdscr.addstr(h - 2, 0, "─" * (w - 1))
+                self._safe_addstr(stdscr, h - 2, 0, "─" * (w - 1))
                 footer = " p: probe view | r: trigger probes | q: back to prompt "
-                stdscr.addstr(h - 1, 0, footer[:w - 1], curses.A_REVERSE)
+                self._safe_addstr(stdscr, h - 1, 0, footer[: w - 1], curses.A_REVERSE)
 
             stdscr.refresh()
             time.sleep(0.5)
@@ -904,15 +948,15 @@ class AgentREPL:
     def _render_probe_dashboard(self, stdscr, h: int, w: int, now: str, state_color: dict):
         """Render live quantum probe telemetry and recent probe events in curses."""
         title = f" Quantum Probe Monitor ── {self._node_name} ── {now} "
-        stdscr.addstr(0, 0, title[:w - 1], curses.A_BOLD)
-        stdscr.addstr(1, 0, "─" * (w - 1))
+        self._safe_addstr(stdscr, 0, 0, title[: w - 1], curses.A_BOLD)
+        self._safe_addstr(stdscr, 1, 0, "─" * (w - 1))
 
         header = (
             f"{'Quantum Link':<20} {'Dir':<4} {'State':<12} {'TX/RX':<6} "
             f"{'OK/Fl':<7} {'Status':<10} {'Age':<8} {'ToF / Optical / VLink'}"
         )
-        stdscr.addstr(2, 0, header[:w - 1], curses.A_BOLD)
-        stdscr.addstr(3, 0, "─" * (w - 1))
+        self._safe_addstr(stdscr, 2, 0, header[: w - 1], curses.A_BOLD)
+        self._safe_addstr(stdscr, 3, 0, "─" * (w - 1))
 
         entries = {k: v for k, v in self._table.all().items() if v.is_quantum}
         row = 4
@@ -957,11 +1001,11 @@ class AgentREPL:
                 f"{key[:19]:<20} {entry.direction:<4} {state:<12} {tx_rx:<6} "
                 f"{ok_fl:<7} {status[:9]:<10} {age:<8} {detail}"
             )
-            stdscr.addstr(row, 0, line[:w - 1], color)
+            self._safe_addstr(stdscr, row, 0, line[: w - 1], color)
             row += 1
 
-        stdscr.addstr(split, 0, "─" * (w - 1))
-        stdscr.addstr(split + 1, 0, "Recent Probe Events (TX & RX Time-Tagger)", curses.A_BOLD)
+        self._safe_addstr(stdscr, split, 0, "─" * (w - 1))
+        self._safe_addstr(stdscr, split + 1, 0, "Recent Probe Events (TX & RX Time-Tagger)", curses.A_BOLD)
 
         probe_events = []
         for key, entry in entries.items():
@@ -985,15 +1029,12 @@ class AgentREPL:
                 cnt = pinfo.get("counts", 0)
                 tof = pinfo.get("tof")
                 tof_str = f"{tof:.2e}s" if isinstance(tof, (int, float)) else "—"
-                line = (
-                    f"  {ts.strftime('%H:%M:%S')}  RX  {key:<18} id={pid:<8} {st:<9} "
-                    f"counts={cnt} tof={tof_str}"
-                )
-            stdscr.addstr(split + 2 + i, 0, line[:w - 1], color)
+                line = f"  {ts.strftime('%H:%M:%S')}  RX  {key:<18} id={pid:<8} {st:<9} " f"counts={cnt} tof={tof_str}"
+            self._safe_addstr(stdscr, split + 2 + i, 0, line[: w - 1], color)
 
-        stdscr.addstr(h - 2, 0, "─" * (w - 1))
+        self._safe_addstr(stdscr, h - 2, 0, "─" * (w - 1))
         footer = " p: link view | r: trigger probes | q: back to prompt "
-        stdscr.addstr(h - 1, 0, footer[:w - 1], curses.A_REVERSE)
+        self._safe_addstr(stdscr, h - 1, 0, footer[: w - 1], curses.A_REVERSE)
 
     def _print_help(self):
         print("""

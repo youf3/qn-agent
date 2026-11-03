@@ -13,11 +13,12 @@ class CalibrationInterpreter(LocalTaskInterpreter):
     async def run(self, arg, **kwargs):
         log.debug(f"Received task submit request : {arg} {kwargs}")
         exp_name = arg[0]
-        class_name = arg[1]        
+        class_name = arg[1]
         for k, v in arg[2].items():
             self.parameters[k] = v
+        params = {"exp_type": "local_calibration", **self.parameters}
         exp_id = kwargs["exp_id"]
-        await self.hal.devs["exp_framework"].submit(exp_id, exp_name, class_name, self.parameters)
+        await self.hal.devs["exp_framework"].submit(exp_id, exp_name, class_name, params)
 
     def stop(self):
         log.debug("Stopping local task")

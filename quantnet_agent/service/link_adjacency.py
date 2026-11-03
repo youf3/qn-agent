@@ -598,6 +598,18 @@ class LinkAdjacencyManager:
 
     async def stop(self) -> None:
         self.is_started = False
+        for key, entry in list(self._table.all().items()):
+            if entry.direction == "in":
+                continue
+            if entry.state != LINK_DOWN or entry.last_published_state != LINK_DOWN:
+                self._table.record_transition(key, LINK_DOWN)
+                self._table.update(key, init_since=None)
+                try:
+                    self._publish_state_update(
+                        key, entry, LINK_DOWN, force=True, state_changed=True
+                    )
+                except Exception as exc:
+                    log.debug("Could not publish DOWN for %s on stop: %s", key, exc)
         log.info("LinkAdjacencyManager stopped")
 
     async def connect(self, key: str) -> None:

@@ -38,12 +38,18 @@ class QuantnetAgent:
         self._startup_done = threading.Event()  # signals main thread when startup is complete
 
     async def handle_exit(self, sig: int, frame: Optional[FrameType]) -> None:
-        if self.should_exit:
+        if getattr(self, "_exiting", False) or self.should_exit:
             return  # idempotent — REPL sends SIGTERM; handle_exit may fire twice
-        self.should_exit = True
-        await self._sreg.stop()
-        if hasattr(self, "_link_mgr") and self._link_mgr is not None:
-            await self._link_mgr.stop()
+        self._exiting = True
+        try:
+            if hasattr(self, "node") and getattr(self.node, "local_task_manager", None) is not None:
+                await self.node.local_task_manager.stop()
+            if hasattr(self, "_link_mgr") and self._link_mgr is not None:
+                await self._link_mgr.stop()
+            if self._sreg is not None:
+                await self._sreg.stop()
+        finally:
+            self.should_exit = True
 
     def run(self) -> None:
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())

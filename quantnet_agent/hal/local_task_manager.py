@@ -100,7 +100,10 @@ class LocalTaskManager:
 
     async def stop(self):
         self.is_started = False
-        pass
+        try:
+            await self.report_status("agentState", "UNKNOWN")
+        except Exception as exc:
+            log.debug(f"Could not publish UNKNOWN agentState on stop: {exc}")
 
     async def report_status(self, eventType, value):
         msg = monitor.MonitorEvent(

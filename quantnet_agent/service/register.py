@@ -59,11 +59,14 @@ class Register:
 
     async def stop(self):
         self.started = False
-        await self._client.call("deregister", None)
+        try:
+            await asyncio.wait_for(self._client.call("deregister", None), timeout=3.0)
+        except Exception as e:
+            log.debug(f"Deregister failed or timed out during stop: {e}")
 
     async def _heartbeat(self):
         seq = 1
-        while True:
+        while self.started:
             log.debug(f"Sending heartbeat, seq {seq}")
             msg = monitor.MonitorEvent(rid=self._cid,
                                        ts=datetime.now(timezone.utc).timestamp(),

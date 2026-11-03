@@ -31,6 +31,9 @@ version = {attr = "quantnet_agent.__version__"}
 [tool.setuptools.packages.find]
 include = ["quantnet_agent", "quantnet_agent.*"]
 
+[tool.setuptools.package-data]
+"quantnet_agent.hal.driver" = ["data/*.json"]
+
 [project.scripts]
 quantnet_agent = "quantnet_agent.cli:main"
 quantnet_repl = "quantnet_agent.service.remote_repl:main"

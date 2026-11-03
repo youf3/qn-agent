@@ -62,6 +62,8 @@ class HardwareAbstractionLayer:
             except Exception as e:
                 log.error(f"Cannot instantiate driver class {dev_cls}: {e}")
                 continue
+            dev._msgclient = self._msgclient
+            dev._hal = self
             self.devs[device] = dev
 
         failed = [

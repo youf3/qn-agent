@@ -67,7 +67,10 @@ class AgentScheduler:
         self.cmd_handler = {}
         self.cid = cid
         self.msgclient = msgclient
-        self._exp_start_times: dict = {}  # exp_id -> datetime when first block started
+        self._exp_start_times: dict = {}      # exp_id -> datetime when first block started
+        self._exp_pending_allocs: dict = {}   # exp_id -> remaining allocation count
+        self._exp_done_events: dict = {}      # exp_id -> asyncio.Event set when all allocations finish
+        self._exp_end_deadlines: dict = {}    # exp_id -> datetime deadline for all allocations
 
         def job_listener(event):
             # Fires on EVENT_JOB_EXECUTED and EVENT_JOB_ERROR for both local and remote jobs.
@@ -273,6 +276,12 @@ class AgentScheduler:
             try:
                 await allocation.operation(allocation.parameters, exp_id=allocation.exp_id)
             finally:
+                if allocation.exp_id and allocation.exp_id in self._exp_pending_allocs:
+                    self._exp_pending_allocs[allocation.exp_id] -= 1
+                    if self._exp_pending_allocs[allocation.exp_id] <= 0:
+                        done_evt = self._exp_done_events.get(allocation.exp_id)
+                        if done_evt is not None:
+                            done_evt.set()
                 await pub_job
 
         log.debug(f"Trying to allocate {allocation.name} to {indices}")
@@ -354,7 +363,7 @@ class AgentScheduler:
     async def handle_submit(self, request):
         async with self.lock:
             log.info(f"Received allocation request : {request.serialize()}")
-            exp_id = request.payload.exp_id
+            exp_id = str(getattr(request.payload.exp_id, "_value", request.payload.exp_id))
             timeslotbase = datetime.fromtimestamp(request.payload.timeslotBase._value, tz=timezone.utc)
             base_diff = math.ceil((timeslotbase - self.base) / Constants.SLOTSIZE)
             log.info(f"Allocating tasks on basetime {timeslotbase}, base difference is {base_diff}")
@@ -369,6 +378,7 @@ class AgentScheduler:
                 log.error("Allocation request is too far into the future")
                 return response_obj(expid=exp_id, status=Status(code=6, value=Code(6).name))
 
+            valid_allocations = []
             for allocation in request.payload.allocations:
                 timeslot_indices = [i + base_diff for i in allocation.timeSlot]
                 if not timeslot_indices:
@@ -376,13 +386,25 @@ class AgentScheduler:
                 if not self._are_slots_empty(timeslot_indices):
                     log.error(f"Cannot allocate experiment {exp_id}. Slots are already occupied")
                     return response_obj(expid=exp_id, status=Status(code=6, value=Code(6).name))
+                valid_allocations.append((allocation, timeslot_indices))
 
+            if valid_allocations:
+                self._exp_pending_allocs[exp_id] = self._exp_pending_allocs.get(exp_id, 0) + len(valid_allocations)
+                done_evt = self._exp_done_events.setdefault(exp_id, asyncio.Event())
+                done_evt.clear()
+
+            max_end_time = None
+            for allocation, timeslot_indices in valid_allocations:
                 start_time = self.base + (timeslot_indices[0] * Constants.SLOTSIZE)
+                duration = Constants.SLOTSIZE * len(allocation.timeSlot)
+                end_time = start_time + duration
+                if max_end_time is None or end_time > max_end_time:
+                    max_end_time = end_time
                 allocation_obj = Allocation(
                     allocation.expName._value,
                     submit_task,
                     start_time,
-                    Constants.SLOTSIZE * len(allocation.timeSlot),
+                    duration,
                     exp_id=exp_id,
                     parameters=allocation,
                     result_handler=result_handler,
@@ -392,30 +414,51 @@ class AgentScheduler:
                 self._alloc_by_name[allocation_obj.name] = allocation_obj
                 self.show_schedule()
 
+            if max_end_time is not None:
+                self._exp_end_deadlines[exp_id] = max_end_time + timedelta(seconds=60)
+
             return response_obj(expid=exp_id, status=Status(code=0, value=Code(0).name))
 
     async def handle_update_result(self, request):
         log.info(f"Received getResult request : {request.serialize()}")
         getResult_task = self.cmd_handler[request.cmd][0]
         response_obj = self.cmd_handler[request.cmd][2]
-        exp_id = request.payload.expid._value
+        exp_id = str(getattr(request.payload.expid, "_value", request.payload.expid))
 
         # Find any pending allocation OR check if exp already started via _exp_start_times.
         # remote_allocations only keeps pending (not-yet-fired) jobs, so completed blocks
         # are pruned. We must also look at _exp_start_times for already-started experiments.
         matching_allocation = next((alloc for alloc in self.remote_allocations if alloc.exp_id == exp_id), None)
 
-        if exp_id not in self._exp_start_times and matching_allocation is None:
+        if (
+            exp_id not in self._exp_start_times
+            and matching_allocation is None
+            and exp_id not in self._exp_done_events
+        ):
             log.error(f"No allocation found for exp_id {exp_id}")
             return response_obj(status=Status(
                 code=Code.FAILED, value=Code.FAILED.name,
                 reason=f"No allocation found for exp_id {exp_id}",
             ))
 
-        if exp_id not in self._exp_start_times:
+        done_evt = self._exp_done_events.get(exp_id)
+        if done_evt is not None and not done_evt.is_set():
+            deadline = self._exp_end_deadlines.get(
+                exp_id,
+                (matching_allocation.start_time if matching_allocation else datetime.now(timezone.utc))
+                + timedelta(seconds=60),
+            )
+            timeout = max(0.1, (deadline - datetime.now(timezone.utc)).total_seconds())
+            try:
+                await asyncio.wait_for(done_evt.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                log.error(f"Timed out waiting for experiment {exp_id} allocations to complete.")
+                return response_obj(status=Status(
+                    code=Code.FAILED, value=Code.FAILED.name,
+                    reason=f"Experiment {exp_id} did not complete within its allocated duration",
+                ))
+        elif exp_id not in self._exp_start_times:
             # Experiment has not started yet — wait until its first block fires.
-            # Use the earliest pending allocation's start_time as the expected start,
-            # with a generous wall-clock deadline (start_time + 60s buffer).
             deadline = matching_allocation.start_time + timedelta(seconds=60)
             while exp_id not in self._exp_start_times:
                 if datetime.now(timezone.utc) > deadline:
@@ -438,7 +481,7 @@ class AgentScheduler:
     async def handle_cancel(self, request):
         log.info(f"Received cancelling request: {request.serialize()}")
         log.debug(f"Current jobs : {self._scheduler.get_jobs()}")
-        exp_id = request.payload.exp_id
+        exp_id = str(getattr(request.payload.exp_id, "_value", request.payload.exp_id))
         response_obj = self.cmd_handler[request.cmd][2]
         try:
             async with self.lock:
@@ -448,6 +491,9 @@ class AgentScheduler:
                     self._alloc_by_name.pop(allocation.name, None)
                 self.remote_allocations = [a for a in self.remote_allocations if a.exp_id != exp_id]
                 self._exp_start_times.pop(exp_id, None)
+                self._exp_pending_allocs.pop(exp_id, None)
+                self._exp_done_events.pop(exp_id, None)
+                self._exp_end_deadlines.pop(exp_id, None)
             return response_obj(status=Status(code=0, value=Code(0).name))
         except JobLookupError:
             return response_obj(status=Status(code=0, value=Code(0).name))

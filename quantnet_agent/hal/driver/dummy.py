@@ -5,6 +5,7 @@ from quantnet_agent.hal.hwclasses import (
     SignalMeasurement,
     ExpFramework,
 )
+from quantnet_mq.schema.models import experiment
 from collections import deque
 from dataclasses import dataclass
 import asyncio
@@ -18,6 +19,53 @@ import time
 import zlib
 
 log = logging.getLogger(__name__)
+
+DEFAULT_DUMMY_RESULTS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "data",
+    "dummy_results.json",
+)
+POL_TRACKING_CHANNELS = ("Bob_H1", "Bob_D2", "Bob_H2", "Alice_H1", "Alice_D2", "Alice_H2")
+
+
+def _load_dummy_results(path: str = DEFAULT_DUMMY_RESULTS_FILE) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+async def replay_pol_tracking(msgclient=None, cid: str = "", exp_id: str = "", interval: float = 0.2) -> dict:
+    pol_data = _load_dummy_results().get("pol_tracking", {})
+    samples = pol_data.get("samples", [])
+    dt = float(interval)
+    base_ts = time.time()
+    step_dt = dt if dt > 0 else 0.05
+    series = []
+
+    for idx, sample in enumerate(samples):
+        sample_copy = dict(sample)
+        ts = time.time() if dt > 0 else round(base_ts + idx * step_dt, 6)
+        series.append({"ts": ts, "pol_tracking": sample_copy})
+        if msgclient is not None:
+            try:
+                await msgclient.publish(
+                    "experiment_data",
+                    {
+                        "cid": str(cid or ""),
+                        "expid": str(exp_id or ""),
+                        "ts": ts,
+                        "data": {"pol_tracking": sample_copy},
+                    },
+                )
+            except Exception as exc:
+                log.warning("Failed to publish pol_tracking sample to experiment_data: %s", exc)
+        if dt > 0 and idx < len(samples) - 1:
+            await asyncio.sleep(dt)
+
+    return {
+        "status": "done",
+        **{k: v for k, v in pol_data.items() if k != "samples"},
+        "pol_tracking_series": series,
+    }
 
 
 @dataclass
@@ -39,28 +87,14 @@ class VirtualLinkEndpoint:
     ch_type: str = "quantum"
 
 
-def _extract_wavelength(raw_wl) -> float:
-    if isinstance(raw_wl, dict):
-        val = raw_wl.get("value", 1550.0)
-        return float(val) if val is not None else 1550.0
-    if isinstance(raw_wl, (int, float, str)):
+def _extract_float(raw, default: float) -> float:
+    val = raw.get("value", default) if isinstance(raw, dict) else raw
+    if isinstance(val, (int, float, str)):
         try:
-            return float(raw_wl)
+            return float(val)
         except ValueError:
-            return 1550.0
-    return 1550.0
-
-
-def _extract_power(raw_power) -> float:
-    if isinstance(raw_power, dict):
-        val = raw_power.get("value", 0.0)
-        return float(val) if val is not None else 0.0
-    if isinstance(raw_power, (int, float, str)):
-        try:
-            return float(raw_power)
-        except ValueError:
-            return 0.0
-    return 0.0
+            return default
+    return default
 
 
 def _normalize_ip(ip_addr: str) -> str:
@@ -176,8 +210,8 @@ def parse_virtual_links(
             local_ip=ip,
             peer_ip=peer_ip,
             port=port,
-            wavelength=_extract_wavelength(ch.get("wavelength")),
-            power=_extract_power(ch.get("power")),
+            wavelength=_extract_float(ch.get("wavelength"), 1550.0),
+            power=_extract_float(ch.get("power"), 0.0),
             ch_type=ch_type,
         )
         if direction == "out":
@@ -528,9 +562,18 @@ class DummyPolarimeter(LightMeasurement):
 
     def __init__(self, *args, **kwargs):
         super().__init__(args, kwargs)
+        props = args[0] if len(args) > 0 and isinstance(args[0], dict) else {}
+        node_file = args[1] if len(args) > 1 else None
         self._wavelength = 0
-        log.info(f"Initializing LightMeasurement with wavelength={self._wavelength}")
-        return
+        self._power = 0
+        self._status = 0
+        self._msgclient = None
+        self._hal = None
+        cid, _, _ = parse_virtual_links(node_file)
+        self._cid = cid or str(props.get("cid", ""))
+        self._sample_interval = float(props.get("sample_interval", 0.2))
+        self.last_calibration_result = None
+        log.info("Initializing DummyPolarimeter with wavelength=%s, cid=%s", self._wavelength, self._cid)
 
     @property
     def wavelength(self):
@@ -545,15 +588,22 @@ class DummyPolarimeter(LightMeasurement):
     def power(self):
         return self._power
 
+    @property
+    def status(self):
+        return self._status
+
     def sweep(self):
         pass
 
-    async def measure(self):
-        log.info("Measuring SOP")
-        for i in range(5):
-            log.info(f"Generating random SOPs :[{random.random()},{random.random()},{random.random()}]")
-            await asyncio.sleep(1)
-        log.info("reached threashold SOP :[0.995, 0.995, 0.995]")
+    async def measure(self, exp_id: str = "", interval=None):
+        dt = self._sample_interval if interval is None else float(interval)
+        log.info("Replaying polarization tracking data (cid=%s, exp_id=%s)", self._cid, exp_id)
+        self.last_calibration_result = await replay_pol_tracking(
+            msgclient=self._msgclient,
+            cid=self._cid,
+            exp_id=exp_id,
+            interval=dt,
+        )
         return 0
 
     async def cleanUp(self):
@@ -565,247 +615,127 @@ class DummyExpFramework(ExpFramework):
 
     def __init__(self, *args, **kwargs):
         super().__init__(args, kwargs)
+        props = args[0] if len(args) > 0 and isinstance(args[0], dict) else {}
+        node_file = args[1] if len(args) > 1 else None
         log.info("Initializing ExpFramework")
         self.result_ind = 0
-        return
+        self._status = 0
+        self._msgclient = None
+        self._hal = None
+        cid, _, _ = parse_virtual_links(node_file)
+        self._cid = cid or str(props.get("cid", ""))
+        self._sample_interval = float(props.get("sample_interval", 0.2))
+        self._dummy_results = _load_dummy_results()
+        self._experiments = {}
 
-    async def submit(self, exp_id, expName, classname, args=dict()):
-        log.info(f"Submitting exp:{expName} with id {id} with args:{args} for 10 sec")
-        # await asyncio.sleep(10)
+    def _init_result(self, exp_type: str) -> dict:
+        template = dict(self._dummy_results.get(exp_type, {}))
+        if exp_type == "local_calibration":
+            scans = template.get("results", [])
+            template["results"] = scans[self.result_ind % len(scans)] if scans else {}
+            self.result_ind += 1
+        return {
+            "status": "done",
+            "exp_type": exp_type,
+            "node": self._cid or "unknown",
+            "steps": [],
+            **template,
+        }
+
+    async def _run_calibration_step(self, state, exp_name: str, params: dict):
+        res = json.loads(str(state.result))
+        if exp_name in ("calibration.srcInit", "calibration.generation"):
+            res["role"] = "src"
+            state.result = json.dumps(res)
+            if exp_name == "calibration.generation" and self._hal and "lightsource" in self._hal.devs:
+                if "power" in params:
+                    self._hal.devs["lightsource"].power = params["power"]
+        elif exp_name == "calibration.dstInit":
+            res["role"] = "dst"
+            state.result = json.dumps(res)
+        elif exp_name == "calibration.calibration":
+            res["role"] = "dst"
+            state.result = json.dumps(res)
+            polarimeter = self._hal.devs.get("polarimeter") if self._hal else None
+            if polarimeter is not None:
+                polarimeter._msgclient = polarimeter._msgclient or self._msgclient
+                polarimeter._cid = polarimeter._cid or self._cid
+                await polarimeter.measure(exp_id=str(state.id))
+                cal_res = polarimeter.last_calibration_result or {}
+            else:
+                cal_res = await replay_pol_tracking(
+                    self._msgclient, self._cid, str(state.id), self._sample_interval
+                )
+            res = json.loads(str(state.result))
+            res.update(cal_res)
+            state.result = json.dumps(res)
+            if str(state.phase) == "cleanup":
+                state.phase = "done"
+                state.end_ts = time.time()
+            else:
+                state.phase = "measured"
+        elif exp_name == "calibration.cleanUp":
+            if res.get("role") != "dst" or str(state.phase) == "measured":
+                state.phase = "done"
+                state.end_ts = time.time()
+            else:
+                state.phase = "cleanup"
+
+    async def submit(self, exp_id, expName, classname, args=None):
+        exp_key = str(getattr(exp_id, "_value", exp_id) or "")
+        exp_name = str(expName or "")
+        params = dict(args or {})
+        exp_type = str(params.pop("exp_type", None) or "generic")
+        log.info(f"Submitting exp:{exp_name} with id {exp_key} (type={exp_type}) with args:{params}")
+
+        if not exp_key:
+            return 0
+
+        state = self._experiments.get(exp_key)
+        if state is None:
+            state = experiment.experimentRecord(
+                id=exp_key,
+                phase="started",
+                start_ts=time.time(),
+                result=json.dumps(self._init_result(exp_type)),
+            )
+            self._experiments[exp_key] = state
+
+        res = json.loads(str(state.result))
+        if exp_name:
+            res["steps"].append(exp_name)
+        if params:
+            res.setdefault("parameters", {}).update(params)
+
+        if res["exp_type"] == "calibration":
+            state.result = json.dumps(res)
+            await self._run_calibration_step(state, exp_name, params)
+        else:
+            if res["exp_type"] == "dqc":
+                if exp_name == "entanglement_prefill":
+                    res["prefill_blocks_executed"] += 1
+                elif exp_name.startswith("Block_"):
+                    res["gate_blocks_executed"] += 1
+                else:
+                    res["entanglement_blocks_executed"] += 1
+            state.result = json.dumps(res)
+            state.phase = "done"
+            state.end_ts = time.time()
         return 0
 
-    async def receive(self, *args, **kwargs):
-        exp_id = args[0]
-        log.info(f"Receiving result from exp:{exp_id}")
-        results = [
-            {
-                "current_scan.plots.x": [
-                    170000000.0,
-                    172068965.5172414,
-                    174137931.03448275,
-                    176206896.55172414,
-                    178275862.06896552,
-                    180344827.58620688,
-                    182413793.10344827,
-                    184482758.62068966,
-                    186551724.13793105,
-                    188620689.6551724,
-                    190689655.1724138,
-                    192758620.68965518,
-                    194827586.20689654,
-                    196896551.72413793,
-                    198965517.24137932,
-                    201034482.75862068,
-                    203103448.27586207,
-                    205172413.79310346,
-                    207241379.31034482,
-                    209310344.8275862,
-                    211379310.3448276,
-                    213448275.86206895,
-                    215517241.37931034,
-                    217586206.89655173,
-                    219655172.4137931,
-                    221724137.93103448,
-                    223793103.44827586,
-                    225862068.96551722,
-                    227931034.4827586,
-                    230000000.0,
-                ],
-                "current_scan.plots.y": [
-                    [1896.0],
-                    [1715.0],
-                    [1913.0],
-                    [1844.0],
-                    [2061.0],
-                    [1977.0],
-                    [1936.0],
-                    [2039.0],
-                    [1937.0],
-                    [2319.0],
-                    [2458.0],
-                    [2743.0],
-                    [2943.0],
-                    [3469.0],
-                    [4059.0],
-                    [4817.0],
-                    [5377.0],
-                    [5807.0],
-                    [6039.0],
-                    [6113.0],
-                    [4882.0],
-                    [3784.0],
-                    [3607.0],
-                    [4132.0],
-                    [4200.0],
-                    [4517.0],
-                    [4693.0],
-                    [5064.0],
-                    [5146.0],
-                    [2963.0],
-                ],
-            },
-            {
-                "current_scan.plots.x": [
-                    30.0,
-                    28.94736842105263,
-                    27.894736842105264,
-                    26.842105263157894,
-                    25.789473684210527,
-                    24.736842105263158,
-                    23.684210526315788,
-                    22.63157894736842,
-                    21.578947368421055,
-                    20.526315789473685,
-                    19.473684210526315,
-                    18.42105263157895,
-                    17.36842105263158,
-                    16.315789473684212,
-                    15.263157894736842,
-                    14.210526315789474,
-                    13.157894736842106,
-                    12.105263157894736,
-                    11.05263157894737,
-                    10.0,
-                ],
-                "current_scan.plots.y": [
-                    [-2.0],
-                    [-26.0],
-                    [15.0],
-                    [4.0],
-                    [-31.0],
-                    [-14.0],
-                    [69.0],
-                    [63.0],
-                    [149.0],
-                    [177.0],
-                    [494.0],
-                    [576.0],
-                    [1112.0],
-                    [2253.0],
-                    [2947.0],
-                    [3776.0],
-                    [4876.0],
-                    [5963.0],
-                    [7261.0],
-                    [8522.0],
-                ],
-            },
-            {
-                "current_scan.plots.x": [
-                    60000000.0,
-                    61379310.344827585,
-                    62758620.68965517,
-                    64137931.03448276,
-                    65517241.37931035,
-                    66896551.72413793,
-                    68275862.06896552,
-                    69655172.4137931,
-                    71034482.7586207,
-                    72413793.10344827,
-                    73793103.44827586,
-                    75172413.79310346,
-                    76551724.13793103,
-                    77931034.48275863,
-                    79310344.8275862,
-                    80689655.1724138,
-                    82068965.51724139,
-                    83448275.86206897,
-                    84827586.20689656,
-                    86206896.55172414,
-                    87586206.89655173,
-                    88965517.24137932,
-                    90344827.5862069,
-                    91724137.93103449,
-                    93103448.27586207,
-                    94482758.62068966,
-                    95862068.96551725,
-                    97241379.31034483,
-                    98620689.65517241,
-                    100000000.0,
-                ],
-                "current_scan.plots.y": [
-                    [3034.0],
-                    [3063.0],
-                    [3198.0],
-                    [3290.0],
-                    [3017.0],
-                    [3097.0],
-                    [3066.0],
-                    [3188.0],
-                    [3201.0],
-                    [3348.0],
-                    [3278.0],
-                    [3243.0],
-                    [3223.0],
-                    [3145.0],
-                    [3238.0],
-                    [3159.0],
-                    [3193.0],
-                    [3328.0],
-                    [3227.0],
-                    [3342.0],
-                    [3338.0],
-                    [3433.0],
-                    [3293.0],
-                    [3261.0],
-                    [3205.0],
-                    [3437.0],
-                    [3306.0],
-                    [3325.0],
-                    [3359.0],
-                    [3394.0],
-                ],
-            },
-            {
-                "current_scan.plots.x": [
-                    30.0,
-                    28.94736842105263,
-                    27.894736842105264,
-                    26.842105263157894,
-                    25.789473684210527,
-                    24.736842105263158,
-                    23.684210526315788,
-                    22.63157894736842,
-                    21.578947368421055,
-                    20.526315789473685,
-                    19.473684210526315,
-                    18.42105263157895,
-                    17.36842105263158,
-                    16.315789473684212,
-                    15.263157894736842,
-                    14.210526315789474,
-                    13.157894736842106,
-                    12.105263157894736,
-                    11.05263157894737,
-                    10.0,
-                ],
-                "current_scan.plots.y": [
-                    [3514.0],
-                    [3372.0],
-                    [3508.0],
-                    [3575.0],
-                    [3508.0],
-                    [3536.0],
-                    [3671.0],
-                    [3489.0],
-                    [3597.0],
-                    [3494.0],
-                    [3596.0],
-                    [3576.0],
-                    [3661.0],
-                    [3721.0],
-                    [3531.0],
-                    [3609.0],
-                    [3596.0],
-                    [3626.0],
-                    [3681.0],
-                    [3543.0],
-                ],
-            },
-        ]
-        index = self.result_ind % 4
-        self.result_ind += 1
-        return {"dummy status": "done", "results": results[index]}
+    async def receive(self, exp_id, *args, **kwargs):
+        exp_key = str(getattr(exp_id, "_value", exp_id) or "")
+        log.info(f"Receiving result from exp:{exp_key}")
+        state = self._experiments.get(exp_key)
+        if state is None:
+            return {}
+        deadline = time.monotonic() + 30.0
+        while str(state.phase) != "done":
+            if time.monotonic() >= deadline:
+                log.warning("Timed out waiting for exp %s to finish all steps", exp_key)
+                break
+            await asyncio.sleep(0.01)
+        return json.loads(str(state.result))
 
     @property
     def logs(self):

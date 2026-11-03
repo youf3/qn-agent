@@ -15,11 +15,16 @@ class ExperimentFramework(ScheduleableInterpreter):
         log.info(f"Received Experiment submit request : {exp_info} {exp_param}")
         exp_name = exp_info[0].expName._value
         class_name = exp_info[0].className._value if "className" in exp_info[0] else None
+        params = {}
         for i in exp_info[0].parameters.data:
-            for k, v in i.items():
-                self.parameters[k] = v
+            item = i.as_dict() if hasattr(i, "as_dict") else dict(i.items())
+            if "name" in item and "value" in item and len(item) == 2:
+                params[item["name"]] = item["value"]
+            else:
+                params.update(item)
+        self.parameters = dict(params)
         exp_id = exp_param["exp_id"]
-        await self.hal.devs["exp_framework"].submit(exp_id, exp_name, class_name, self.parameters)
+        await self.hal.devs["exp_framework"].submit(exp_id, exp_name, class_name, params)
 
     async def update_result(self, exp_id):
         log.info(f"Getting experiment result for {exp_id}")
